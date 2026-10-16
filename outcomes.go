@@ -2,6 +2,7 @@ package nxs
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"time"
 )
@@ -36,7 +37,12 @@ func (p *Provider) flush(ctx context.Context) error {
 	defer p.opMu.Unlock()
 	p.st.PendingEvents = pending
 	if err := p.signed(ctx, "outcomes", map[string]any{"events": batch}, nil, 1, 3*time.Second); err != nil {
-		return err
+		var e *Error
+		if !errors.As(err, &e) || e.Status < 400 || e.Status > 499 || e.retryable() || p.fenced.Load() {
+			return err
+		}
+		// The provider permanently rejected the batch, so retrying it can never succeed.
+		p.log.Debug("provider rejected outcome reports", "error", err, "events", len(batch))
 	}
 	p.mu.Lock()
 	p.events = p.events[len(batch):]

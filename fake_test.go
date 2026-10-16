@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,13 +48,18 @@ type fakeProvider struct {
 	retireAfter int64
 	// delivered records the admission key requests that were answered.
 	delivered map[string]bool
+
+	fenced         bool
+	fencedRequests int
+	forget         bool
+	forgetProfile  bool
 }
 
 func newFakeProvider(t *testing.T) *fakeProvider {
 	f := &fakeProvider{
 		t:          t,
 		challenges: map[string]*challenge{},
-		keys:       []admission.Key{{ID: "K001", Secret: "fake-provider-secret-at-least-32-bytes"}},
+		keys:       []admission.Key{{ID: "K001", Secret: fakeSecret(0)}},
 		keyID:      "key_1",
 		results:    map[string]chan map[string]any{},
 		delivered:  map[string]bool{},
@@ -63,7 +69,7 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 	mux.HandleFunc("POST /v1/nxs/register", f.register)
 	mux.HandleFunc("POST /v1/nxs/complete", f.complete)
 	mux.HandleFunc("GET /v1/nxs/control", f.control)
-	for _, op := range []string{"heartbeat", "outcomes", "rotate", "retire", "deregister"} {
+	for _, op := range []string{"heartbeat", "outcomes", "rotate", "retire", "deregister", "operator-action"} {
 		mux.HandleFunc("POST /v1/nxs/"+op, func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
 			status, resp := f.operation(op, r.Method, r.URL.RequestURI(), r.Header, body)
@@ -76,6 +82,11 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 	f.origin = f.srv.URL
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+func fakeSecret(n int) string {
+	sum := sha256.Sum256([]byte("fake-provider-secret-" + strconv.Itoa(n)))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
 func (f *fakeProvider) write(w http.ResponseWriter, status int, v any) {
@@ -96,19 +107,15 @@ func (f *fakeProvider) key(id string) (admission.Key, bool) {
 }
 
 func (f *fakeProvider) discovery(w http.ResponseWriter, _ *http.Request) {
-	ops := map[string]string{}
-	for _, op := range operations {
-		ops[op] = f.origin + "/v1/nxs/" + op
-	}
 	f.write(w, http.StatusOK, map[string]any{
-		"provider": f.origin, "controlOrigin": f.origin,
-		"protocols": []string{Protocol}, "signatures": []string{SignatureVersion}, "profiles": []string{Profile},
-		"modes": []string{ModeAutomatic, ModeNewService}, "operations": ops,
-		"authorization": map[string]any{"header": "Authorization", "schemes": []any{map[string]any{"scheme": schemeAnonymous, "modes": []string{ModeAutomatic, ModeNewService}}}},
-		"limits":        map[string]any{"maxBodyBytes": 65536, "clockSkewMs": 60000, "heartbeatIntervalMs": 1000, "leaseMs": 30000},
+		"provider":      f.origin,
+		"protocols":     []string{Protocol},
+		"signatures":    []string{SignatureVersion},
+		"authorization": map[string]any{"schemes": []string{schemeAnonymous}},
+		"limits":        map[string]any{"heartbeatIntervalMs": 1000},
 		"extensions": map[string]any{
 			extensionConnectivity: map[string]any{"version": 1, "critical": false, "data": map[string]any{"stunServers": []any{}}},
-			extensionWebSocket:    map[string]any{"version": 1, "critical": false, "data": map[string]any{"url": "ws" + f.origin[len("http"):] + "/v1/nxs/control", "subprotocol": Protocol}},
+			extensionWebSocket:    map[string]any{"version": 1, "critical": false, "data": map[string]any{}},
 			"com.example.claim":   map[string]any{"version": 1, "critical": false, "data": map[string]any{"operations": map[string]string{"refresh": f.origin + "/v1/nxs/outcomes"}}},
 		},
 	})
@@ -124,17 +131,21 @@ func (f *fakeProvider) register(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	c := &challenge{Protocol: Protocol, Signature: SignatureVersion, ChallengeID: randomID(), Nonce: "nonce", Audience: f.origin,
 		ExpiresAt: time.Now().Add(time.Minute).UnixMilli(), ServerTime: time.Now().UnixMilli()}
-	c.Pow.Algorithm = powAlgorithm
+	if req.RegistrationID != "" && f.forget {
+		f.write(w, http.StatusForbidden, map[string]string{"code": codeRecoveryUnavailable})
+		return
+	}
 	if req.RegistrationID != "" {
-		c.Context = challengeContext{Mode: modeRecover, Profile: Profile, RegistrationID: req.RegistrationID}
+		c.Context = challengeContext{Mode: modeRecover, RegistrationID: req.RegistrationID}
 	} else {
+		f.forget = false
 		pub, err := req.PublicKeyJWK.publicKey()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		f.pub = pub
-		c.Context = challengeContext{Mode: ModeNewService, Profile: Profile}
+		c.Context = challengeContext{Mode: modeNewService}
 		c.Pow.Difficulty = 4
 	}
 	c.Thumbprint = publicJWK(f.pub).thumbprint()
@@ -162,11 +173,11 @@ func (f *fakeProvider) complete(w http.ResponseWriter, r *http.Request) {
 	f.sequence = 0
 	f.generation++
 	reg := registration{Protocol: Protocol, Provider: f.origin, RegistrationID: "reg_1", InstanceID: "instance_1", KeyID: f.keyID,
-		Profile: Profile, HeartbeatIntervalMs: 1000, LeaseGeneration: f.generation, LeaseDeadline: time.Now().Add(time.Minute).UnixMilli(),
-		Readiness: Readiness{Reasons: []string{}}, ServiceID: "svc_1", PublicAddress: "https://test.example",
+		LeaseGeneration: f.generation, ServiceID: "svc_1", PublicAddress: "https://test.example",
 		Extensions: map[string]extension{"com.example.claim": {Version: 1, Data: json.RawMessage(`{"url":"https://claim.example"}`)}}}
 	if c.Context.Mode != modeRecover {
-		reg.TicketKey = &ticketKey{KeyID: f.keys[0].ID, Secret: f.keys[0].Secret}
+		reg.AdmissionKey = &ticketKey{KeyID: f.keys[0].ID, Secret: f.keys[0].Secret}
+		reg.OperatorAction = &operatorAction{URL: "https://claim.example/one-time", Text: "Claim this server", ExpiresAt: time.Now().Add(3 * time.Second).UnixMilli()}
 	}
 	f.write(w, http.StatusOK, reg)
 }
@@ -200,6 +211,15 @@ func (f *fakeProvider) authenticate(method, path string, h http.Header, body []b
 
 // operation handles a signed operation received over HTTPS or the WebSocket.
 func (f *fakeProvider) operation(op, method, path string, h http.Header, body []byte) (int, any) {
+	f.mu.Lock()
+	fenced := f.fenced
+	if fenced {
+		f.fencedRequests++
+	}
+	f.mu.Unlock()
+	if fenced {
+		return http.StatusConflict, map[string]string{"code": codeGenerationFenced}
+	}
 	if !f.authenticate(method, path, h, body) {
 		return http.StatusUnauthorized, map[string]string{"code": "auth_invalid"}
 	}
@@ -227,6 +247,8 @@ func (f *fakeProvider) operation(op, method, path string, h http.Header, body []
 		}
 		f.pub, f.keyID = pub, "key_2"
 		return http.StatusOK, map[string]string{"keyId": f.keyID}
+	case "operator-action":
+		return http.StatusOK, map[string]any{"operatorAction": operatorAction{URL: "https://claim.example/fresh", Text: "Claim this server", ExpiresAt: time.Now().Add(time.Hour).UnixMilli()}}
 	}
 	return http.StatusOK, map[string]any{}
 }
@@ -245,30 +267,31 @@ func (f *fakeProvider) heartbeat(body []byte) (int, any) {
 	rev := "rev_" + strconv.Itoa(len(f.heartbeats))
 	if req.HostProfile == nil {
 		rev = req.HostProfileRevision
+		if f.forgetProfile {
+			f.forgetProfile, rev = false, "rev_other"
+		}
 	}
-	now := time.Now().UTC()
-	resp := heartbeatResponse{Accepted: true, ReceivedAt: now.Format(time.RFC3339Nano), StaleAfter: now.Add(30 * time.Second).Format(time.RFC3339Nano),
-		HostProfileRevision: &rev, ActiveKeyID: f.keys[len(f.keys)-1].ID, LeaseGeneration: f.generation,
-		Readiness: Readiness{Routable: req.AcceptingPlayers, Reasons: []string{}}}
-	resp.Retirements = []struct {
+	resp := heartbeatResponse{HostProfileRevision: &rev, Readiness: Readiness{Routable: req.AcceptingPlayers, Reasons: []string{}},
+		CheckIn: &checkIn{AfterMillis: 1000, LeaseMillis: 30000, MinUpdateIntervalMillis: 1000}, OperatorActionAvailable: true}
+	resp.AdmissionKeyRetirements = []struct {
 		KeyID       string `json:"keyId"`
 		RetireAfter int64  `json:"retireAfter"`
 	}{}
 	if f.retireAfter != 0 {
-		resp.Retirements = append(resp.Retirements, struct {
+		resp.AdmissionKeyRetirements = append(resp.AdmissionKeyRetirements, struct {
 			KeyID       string `json:"keyId"`
 			RetireAfter int64  `json:"retireAfter"`
 		}{f.keys[0].ID, f.retireAfter})
 	}
-	if req.KeyRequestID != "" && !f.delivered[req.KeyRequestID] {
-		f.delivered[req.KeyRequestID] = true
-		k := admission.Key{ID: fmt.Sprintf("K%03d", len(f.keys)+1), Secret: "fake-provider-replacement-secret-" + strconv.Itoa(len(f.keys))}
+	if req.AdmissionKeyRequestID != "" && !f.delivered[req.AdmissionKeyRequestID] {
+		f.delivered[req.AdmissionKeyRequestID] = true
+		k := admission.Key{ID: fmt.Sprintf("K%03d", len(f.keys)+1), Secret: fakeSecret(len(f.keys))}
 		f.keys = append(f.keys, k)
-		resp.KeyRequest = &struct {
+		resp.AdmissionKeyRequest = &struct {
 			ID    string `json:"id"`
 			KeyID string `json:"keyId"`
-		}{req.KeyRequestID, k.ID}
-		resp.TicketKey = &ticketKey{KeyID: k.ID, Secret: k.Secret}
+		}{req.AdmissionKeyRequestID, k.ID}
+		resp.AdmissionKey = &ticketKey{KeyID: k.ID, Secret: k.Secret}
 	}
 	if f.feedback != nil {
 		var data struct {
@@ -336,14 +359,17 @@ func (f *fakeProvider) control(w http.ResponseWriter, r *http.Request) {
 			f.mu.Unlock()
 		}
 		out, _ := json.Marshal(resp)
-		reply, _ := json.Marshal(wsReply{ID: h.Get("idempotency-key"), Status: status, Headers: map[string]string{"content-type": "application/json"}, Body: string(out)})
+		reply, _ := json.Marshal(wsReply{Kind: "response", ID: h.Get("idempotency-key"), Status: status, Headers: map[string]string{"content-type": "application/json"}, Body: string(out)})
 		_ = conn.Write(context.Background(), websocket.MessageText, reply)
 	}
 }
 
 // assist sends an assisted join to the host and returns its answer.
 func (f *fakeProvider) assist(ctx context.Context, join map[string]any) (string, error) {
-	id := randomID()
+	id, ok := join["id"].(string)
+	if !ok {
+		id = randomID()
+	}
 	join["kind"], join["version"], join["id"] = "assisted-join", 1, id
 	ch := make(chan map[string]any, 1)
 	f.mu.Lock()

@@ -101,6 +101,9 @@ func (h *host) authorizeDiagnostic(key admission.Key, claims admission.Claims, f
 	if k, ok := pol.keys[key.ID]; !ok || k.Secret != key.Secret {
 		return errors.New("admission key not authorized for diagnostics")
 	}
+	if !key.Usable(now) || (!key.RetireAfter.IsZero() && claims.ExpiresAt.After(key.RetireAfter)) {
+		return errors.New("diagnostic outlives its admission key")
+	}
 	if d.Family() != family || int64(d.CandidateRevision) != pol.revision || claims.SCTPPort != sctpPort || claims.MaxMessageSize != maxMessageSize {
 		return errors.New("diagnostic does not match the published profile")
 	}
@@ -146,7 +149,7 @@ func (h *host) diagnostic(key admission.Key, claims admission.Claims, token, cli
 		ICE:       webrtc.ICEParameters{UsernameFragment: clientUfrag, Password: claims.Password},
 		DTLS:      remoteDTLS(claims.Fingerprint[:]),
 		SCTP:      webrtc.SCTPCapabilities{MaxMessageSize: claims.MaxMessageSize},
-	}, password, claims)
+	}, password, key, claims, family)
 }
 
 // reserveDiagnostic reserves a diagnostic attempt within the bounds of the gate.
@@ -168,8 +171,8 @@ func (h *host) reserveDiagnostic(token string, addr netip.AddrPort, claims admis
 		return nil, false
 	}
 	h.mu.Unlock()
-	a, ok := h.reserve(token, addr, claims.ExpiresAt, first)
-	if !ok {
+	a, _ := h.reserve(token, addr, claims.ExpiresAt, first)
+	if a == nil {
 		return nil, false
 	}
 	h.mu.Lock()
@@ -179,8 +182,9 @@ func (h *host) reserveDiagnostic(token string, addr netip.AddrPort, claims admis
 	return a, true
 }
 
-// echo establishes a diagnostic connection, answers its PING and closes it.
-func (h *host) echo(a *attempt, adm nethernet.Admission, password string, claims admission.Claims) {
+// echo establishes a diagnostic connection, answers its PING and closes it. The connection is
+// closed early once the diagnostic is no longer authorized.
+func (h *host) echo(a *attempt, adm nethernet.Admission, password string, key admission.Key, claims admission.Claims, family int) {
 	defer func() {
 		h.mu.Lock()
 		h.diag.active--
@@ -198,6 +202,7 @@ func (h *host) echo(a *attempt, adm nethernet.Admission, password string, claims
 	defer conn.Close()
 	timer := time.AfterFunc(deadline, func() { _ = conn.Close() })
 	defer timer.Stop()
+	go h.withdrawDiagnostic(a, conn, key, claims, family)
 
 	b, err := conn.ReadPacket()
 	if err != nil {
@@ -217,6 +222,32 @@ func (h *host) echo(a *attempt, adm nethernet.Admission, password string, claims
 	select {
 	case <-conn.Context().Done():
 	case <-time.After(diagnosticLinger):
+	}
+}
+
+// withdrawDiagnostic closes conn once its diagnostic is withdrawn: when the policy, its key or
+// its target is removed or replaced, or the attempt is canceled.
+func (h *host) withdrawDiagnostic(a *attempt, conn *nethernet.Conn, key admission.Key, claims admission.Claims, family int) {
+	var canceled <-chan struct{}
+	if a.ctx != nil {
+		canceled = a.ctx.Done()
+	}
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-conn.Context().Done():
+			return
+		case <-canceled:
+		case <-t.C:
+			current, ok := (*h.keys.Load())[key.ID]
+			if ok && current.Secret == key.Secret && h.authorizeDiagnostic(current, claims, family) == nil {
+				continue
+			}
+		}
+		h.log.Debug("diagnostic withdrawn", "addr", conn.RemoteAddr())
+		_ = conn.Close()
+		return
 	}
 }
 

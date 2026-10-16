@@ -13,8 +13,6 @@ import (
 	"fmt"
 	"math/big"
 	"math/bits"
-	"sort"
-	"strings"
 
 	"github.com/df-mc/go-nxs/internal/canon"
 )
@@ -24,12 +22,8 @@ const (
 	Protocol = "nethernet-external-signaling-v1"
 	// SignatureVersion is the machine request signature identifier.
 	SignatureVersion = "nxs-es384-v1"
-	// Profile is the operational profile identifier.
-	Profile = "nxs-admission-v1"
 	// Capability is the stateless admission capability published in host profiles.
 	Capability = "nethernet.stateless-admission.v1"
-
-	powAlgorithm = "sha256-leading-zero-bits-v0"
 )
 
 var b64 = base64.RawURLEncoding
@@ -131,47 +125,18 @@ func digest(b []byte) string {
 // challengeContext is the registration context bound into a challenge.
 type challengeContext struct {
 	Mode            string `json:"mode"`
-	Profile         string `json:"profile"`
 	Label           string `json:"label"`
 	AuthorizationID string `json:"authorizationId"`
 	ServiceID       string `json:"serviceId"`
-	Region          string `json:"region"`
-	Pool            string `json:"pool"`
 	RegistrationID  string `json:"registrationId"`
-	TagsDigest      string `json:"tagsDigest,omitempty"`
 }
 
 func (c challengeContext) digest() (string, error) {
-	values := []any{c.Mode, c.Profile, c.Label, c.AuthorizationID, c.ServiceID, c.Region, c.Pool, c.RegistrationID}
-	if c.TagsDigest != "" {
-		values = append(values, c.TagsDigest)
-	}
-	b, err := canon.Array(values...)
+	b, err := canon.Array(c.Mode, c.Label, c.AuthorizationID, c.ServiceID, c.RegistrationID)
 	if err != nil {
 		return "", err
 	}
 	return digest(b), nil
-}
-
-// tagsDigest returns the digest of sorted placement tags, or an empty string without tags.
-func tagsDigest(tags map[string]string) (string, error) {
-	if len(tags) == 0 {
-		return "", nil
-	}
-	keys := make([]string, 0, len(tags))
-	for k := range tags {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	pairs := make([]string, len(keys))
-	for i, k := range keys {
-		b, err := canon.Array(k, tags[k])
-		if err != nil {
-			return "", err
-		}
-		pairs[i] = string(b)
-	}
-	return digest([]byte("[" + strings.Join(pairs, ",") + "]")), nil
 }
 
 // proof returns the completion proof bytes of a challenge.

@@ -48,8 +48,6 @@ func (p *Provider) method() string {
 	switch {
 	case len(p.conf.Endpoints) > 0:
 		return "defined"
-	case p.assisting():
-		return "per_join"
 	case slices.ContainsFunc(p.endpoints.all, func(c candidate) bool { return c.Type == "srflx" }):
 		return "warm_stun"
 	}
@@ -104,6 +102,10 @@ func (p *Provider) mappings(ctx context.Context) []netip.AddrPort {
 			p.log.Debug("STUN mapping failed", "server", server, "error", err)
 			continue
 		}
+		if !p.host.reachable(addr.Addr()) {
+			p.log.Debug("STUN mapping is not a public address", "server", server, "mapping", addr)
+			continue
+		}
 		if !slices.Contains(addrs, addr) {
 			addrs = append(addrs, addr)
 		}
@@ -112,20 +114,31 @@ func (p *Provider) mappings(ctx context.Context) []netip.AddrPort {
 }
 
 // publish updates the published candidates, withholding public endpoints that failed
-// every completed check. opMu must be held.
+// every completed check. Discovered private endpoints are only published if no public
+// endpoint exists or one failed. opMu must be held.
 func (p *Provider) publish() {
 	e := &p.endpoints
-	published := e.all
-	if !p.assisting() && len(e.checks) > 0 {
-		published = slices.DeleteFunc(slices.Clone(e.all), func(c candidate) bool {
-			addr, err := netip.ParseAddr(c.Address)
-			return err == nil && !addr.IsPrivate() && p.withheld(netip.AddrPortFrom(addr, c.Port))
-		})
+	public, failed := false, false
+	for _, c := range e.all {
+		if addr, err := netip.ParseAddr(c.Address); err == nil && p.host.reachable(addr) {
+			public = true
+			failed = failed || p.withheld(netip.AddrPortFrom(addr, c.Port))
+		}
 	}
+	published := slices.DeleteFunc(slices.Clone(e.all), func(c candidate) bool {
+		addr, err := netip.ParseAddr(c.Address)
+		if err != nil {
+			return false
+		}
+		if !p.host.reachable(addr) {
+			return len(p.conf.Endpoints) == 0 && public && !failed
+		}
+		return !p.assisting() && p.withheld(netip.AddrPortFrom(addr, c.Port))
+	})
 	if !slices.Equal(published, e.published) {
 		e.published = published
 		p.published.Store(&published)
-		p.poke()
+		p.pokeNow()
 	}
 }
 
@@ -207,7 +220,7 @@ func (p *Provider) assistedFamilies() []int {
 		}
 	}
 	for _, c := range p.endpoints.all {
-		if addr, err := netip.ParseAddr(c.Address); err == nil && !addr.IsPrivate() {
+		if addr, err := netip.ParseAddr(c.Address); err == nil && p.host.reachable(addr) {
 			add(addr)
 		}
 	}

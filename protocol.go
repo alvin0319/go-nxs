@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -18,22 +19,15 @@ const (
 	extensionConnectivity = "dev.opencollab.nxs.connectivity"
 	extensionWebSocket    = "dev.opencollab.nxs.websocket"
 
-	assistedCapability = "nethernet.websocket-assisted.v1"
-
 	schemeAnonymous = "anonymous-proof-of-work"
 	schemeBearer    = "bearer-token"
 
-	// ModeAutomatic lets the provider choose between creating a service and attaching an instance.
-	ModeAutomatic = "automatic"
-	// ModeNewService creates a new service with this instance.
-	ModeNewService = "new-service"
-	// ModeAttachInstance attaches this instance to an existing service. It requires a token and Placement.
-	ModeAttachInstance = "attach-instance"
+	modeNewService     = "new-service"
+	modeAttachInstance = "attach-instance"
+	modeRecover        = "recover"
 
-	modeRecover = "recover"
+	maxBodyBytes = 65536
 )
-
-var operations = []string{"register", "complete", "heartbeat", "outcomes", "rotate", "retire", "deregister"}
 
 // extension is an optional protocol extension.
 type extension struct {
@@ -43,72 +37,65 @@ type extension struct {
 }
 
 type discovery struct {
-	Provider      string            `json:"provider"`
-	ControlOrigin string            `json:"controlOrigin"`
-	Protocols     []string          `json:"protocols"`
-	Signatures    []string          `json:"signatures"`
-	Profiles      []string          `json:"profiles"`
-	Modes         []string          `json:"modes"`
-	Operations    map[string]string `json:"operations"`
+	Provider      string   `json:"provider"`
+	Protocols     []string `json:"protocols"`
+	Signatures    []string `json:"signatures"`
 	Authorization struct {
-		Header  string `json:"header"`
-		Schemes []struct {
-			Scheme string   `json:"scheme"`
-			Modes  []string `json:"modes"`
-		} `json:"schemes"`
+		Schemes []string `json:"schemes"`
 	} `json:"authorization"`
 	Limits struct {
-		MaxBodyBytes        int64 `json:"maxBodyBytes"`
-		ClockSkewMs         int64 `json:"clockSkewMs"`
 		HeartbeatIntervalMs int64 `json:"heartbeatIntervalMs"`
-		LeaseMs             int64 `json:"leaseMs"`
 	} `json:"limits"`
 	Extensions map[string]extension `json:"extensions"`
 }
 
-// validate checks that discovery is usable for the origin, registration scheme and mode.
-func (d *discovery) validate(origin, scheme, mode string) error {
-	if d.Provider != origin || d.ControlOrigin != origin {
+// validate checks that discovery is usable for the origin and registration scheme.
+func (d *discovery) validate(origin, scheme string) error {
+	if d.Provider != origin {
 		return errors.New("provider origin mismatch")
 	}
 	for _, c := range []struct {
 		name   string
 		values []string
 		want   string
-	}{{"protocol", d.Protocols, Protocol}, {"signature", d.Signatures, SignatureVersion}, {"profile", d.Profiles, Profile}, {"mode", d.Modes, mode}} {
+	}{{"protocol", d.Protocols, Protocol}, {"signature", d.Signatures, SignatureVersion}, {"authorization scheme", d.Authorization.Schemes, scheme}} {
 		if !slices.Contains(c.values, c.want) {
 			return fmt.Errorf("unsupported %s %q", c.name, c.want)
 		}
 	}
-	if d.Authorization.Header != "Authorization" {
-		return errors.New("unsupported authorization header")
-	}
-	supported := false
-	for _, s := range d.Authorization.Schemes {
-		supported = supported || (s.Scheme == scheme && slices.Contains(s.Modes, mode))
-	}
-	if !supported {
-		return fmt.Errorf("provider does not accept %s registration with mode %s", scheme, mode)
-	}
-	for _, op := range operations {
-		u, ok := d.Operations[op]
-		if !ok {
-			return fmt.Errorf("missing operation %s", op)
-		}
-		if _, err := operationURL(origin, u); err != nil {
-			return fmt.Errorf("operation %s: %w", op, err)
-		}
-	}
-	if l := d.Limits; l.HeartbeatIntervalMs < 1000 || l.HeartbeatIntervalMs > 30000 || l.MaxBodyBytes < 1 ||
-		l.MaxBodyBytes > 65536 || l.ClockSkewMs < 0 || l.ClockSkewMs > 60000 {
+	if l := d.Limits; l.HeartbeatIntervalMs < 1000 || l.HeartbeatIntervalMs > 30000 {
 		return errors.New("unsupported provider limits")
 	}
-	for name, ext := range d.Extensions {
-		if ext.Critical && name != extensionConnectivity {
-			return fmt.Errorf("unsupported critical extension %s", name)
+	return checkExtensions(d.Extensions)
+}
+
+var extensionNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*(?:\.[a-z][a-z0-9-]*){1,7}$`)
+
+// checkExtensions checks the extensions of a provider message, and rejects critical ones that
+// are not supported.
+func checkExtensions(exts map[string]extension) error {
+	if len(exts) > 16 {
+		return errors.New("nxs: too many extensions")
+	}
+	if b, err := json.Marshal(exts); err != nil || len(b) > 16384 {
+		return errors.New("nxs: extensions too large")
+	}
+	for name, ext := range exts {
+		if len(name) > 128 || !extensionNamePattern.MatchString(name) || ext.Version < 1 || ext.Version > 999999999 ||
+			!bytes.HasPrefix(bytes.TrimSpace(ext.Data), []byte("{")) {
+			return fmt.Errorf("nxs: invalid extension %s", name)
+		}
+		supported := (name == extensionConnectivity || name == extensionWebSocket) && ext.Version == 1
+		if ext.Critical && !supported {
+			return fmt.Errorf("nxs: unsupported critical extension %s", name)
 		}
 	}
 	return nil
+}
+
+// opURL returns the URL of an operation on the provider origin.
+func opURL(origin, op string) string {
+	return origin + "/v1/nxs/" + op
 }
 
 // stunServers returns the STUN servers advertised by the connectivity extension.
@@ -145,42 +132,13 @@ type authorization struct {
 	Reference string `json:"reference,omitempty"`
 }
 
-// Placement selects the region and pool of an instance.
-type Placement struct {
-	Region string            `json:"region"`
-	Pool   string            `json:"pool"`
-	Tags   map[string]string `json:"tags,omitempty"`
-}
-
-var (
-	regionPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
-	poolPattern   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	tagPattern    = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,32}$`)
-)
-
-func (p *Placement) validate() error {
-	if !regionPattern.MatchString(p.Region) || !poolPattern.MatchString(p.Pool) || len(p.Tags) > 16 {
-		return errors.New("nxs: invalid placement")
-	}
-	for k, v := range p.Tags {
-		if !tagPattern.MatchString(k) || strings.TrimSpace(v) != v || len(v) < 1 || len(v) > 64 || strings.ContainsFunc(v, isControl) {
-			return fmt.Errorf("nxs: invalid placement tag %q", k)
-		}
-	}
-	return nil
-}
-
 func isControl(r rune) bool { return r < 0x20 || (r >= 0x7f && r <= 0x9f) }
 
 type registerRequest struct {
-	Protocol       string         `json:"protocol"`
-	Mode           string         `json:"mode,omitempty"`
-	Profile        string         `json:"profile"`
-	PublicKeyJWK   *jwk           `json:"publicKeyJwk,omitempty"`
-	Label          string         `json:"label,omitempty"`
-	Authorization  *authorization `json:"authorization,omitempty"`
-	Placement      *Placement     `json:"placement,omitempty"`
-	RegistrationID string         `json:"registrationId,omitempty"`
+	Protocol       string `json:"protocol"`
+	PublicKeyJWK   *jwk   `json:"publicKeyJwk,omitempty"`
+	Label          string `json:"label,omitempty"`
+	RegistrationID string `json:"registrationId,omitempty"`
 }
 
 type challenge struct {
@@ -195,8 +153,7 @@ type challenge struct {
 	ExpiresAt     int64            `json:"expiresAt"`
 	ServerTime    int64            `json:"serverTime"`
 	Pow           struct {
-		Algorithm  string `json:"algorithm"`
-		Difficulty int    `json:"difficulty"`
+		Difficulty int `json:"difficulty"`
 	} `json:"pow"`
 	Authorization *authorization `json:"authorization,omitempty"`
 }
@@ -208,7 +165,7 @@ func (c *challenge) validate(origin, thumbprint string) error {
 		return err
 	}
 	if c.Protocol != Protocol || c.Signature != SignatureVersion || c.Audience != origin || c.Thumbprint != thumbprint ||
-		c.ContextDigest != d || c.Context.Profile != Profile || c.Pow.Algorithm != powAlgorithm || c.Pow.Difficulty < 0 || c.Pow.Difficulty > 24 {
+		c.ContextDigest != d || c.Pow.Difficulty < 0 || c.Pow.Difficulty > 24 {
 		return errors.New("nxs: unbound registration challenge")
 	}
 	return nil
@@ -235,37 +192,48 @@ type ticketKey struct {
 	RetireAfter int64  `json:"retireAfter,omitempty"`
 }
 
+// operatorAction is a link the provider offers to the operator of the host. It may carry a
+// one-time credential and is never saved.
+type operatorAction struct {
+	URL       string `json:"url"`
+	Text      string `json:"text"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
 type registration struct {
-	Protocol            string     `json:"protocol"`
-	Provider            string     `json:"provider"`
-	RegistrationID      string     `json:"registrationId"`
-	InstanceID          string     `json:"instanceId"`
-	KeyID               string     `json:"keyId"`
-	Profile             string     `json:"profile"`
-	Placement           Placement  `json:"placement"`
-	HeartbeatIntervalMs int64      `json:"heartbeatIntervalMs"`
-	LeaseGeneration     int64      `json:"leaseGeneration"`
-	LeaseDeadline       int64      `json:"leaseDeadline"`
-	Readiness           Readiness  `json:"readiness"`
-	ServiceID           string     `json:"serviceId,omitempty"`
-	PublicAddress       string     `json:"publicAddress,omitempty"`
-	TicketKey           *ticketKey `json:"ticketKey,omitempty"`
-	// Extensions are optional provider metadata, such as a link to claim the service.
+	Protocol        string          `json:"protocol"`
+	Provider        string          `json:"provider"`
+	RegistrationID  string          `json:"registrationId"`
+	InstanceID      string          `json:"instanceId"`
+	KeyID           string          `json:"keyId"`
+	LeaseGeneration int64           `json:"leaseGeneration"`
+	ServiceID       string          `json:"serviceId,omitempty"`
+	PublicAddress   string          `json:"publicAddress,omitempty"`
+	AdmissionKey    *ticketKey      `json:"admissionKey,omitempty"`
+	OperatorAction  *operatorAction `json:"operatorAction,omitempty"`
+	// Extensions are optional provider metadata.
 	Extensions map[string]extension `json:"extensions,omitempty"`
 }
 
+var (
+	identifierPattern    = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+	publicAddressPattern = regexp.MustCompile(`^https://[^/?#@\s]+(?:[/?#]\S*)?$`)
+)
+
 func (r *registration) validate(origin string) error {
-	if r.Protocol != Protocol || r.Provider != origin || r.Profile != Profile || r.RegistrationID == "" ||
-		r.InstanceID == "" || r.KeyID == "" || r.LeaseGeneration < 1 || (r.ServiceID == "") != (r.PublicAddress == "") {
+	if r.Protocol != Protocol || r.Provider != origin || !identifierPattern.MatchString(r.RegistrationID) ||
+		!identifierPattern.MatchString(r.InstanceID) || !identifierPattern.MatchString(r.KeyID) ||
+		r.LeaseGeneration < 1 || r.LeaseGeneration > 1<<53-1 || (r.ServiceID == "") != (r.PublicAddress == "") {
 		return errors.New("nxs: invalid registration")
 	}
-	return nil
+	if r.ServiceID != "" && (!identifierPattern.MatchString(r.ServiceID) || len(r.PublicAddress) > 2048 || !publicAddressPattern.MatchString(r.PublicAddress)) {
+		return errors.New("nxs: invalid public endpoint of registration")
+	}
+	return checkExtensions(r.Extensions)
 }
 
 type candidate struct {
 	Foundation string `json:"foundation"`
-	Component  int    `json:"component"`
-	Protocol   string `json:"protocol"`
 	Priority   uint32 `json:"priority"`
 	Address    string `json:"address"`
 	Port       uint16 `json:"port"`
@@ -276,85 +244,118 @@ type candidate struct {
 type hostProfile struct {
 	Candidates         []candidate `json:"candidates"`
 	DTLSFingerprint    string      `json:"dtlsFingerprint"`
-	CredentialKeyID    string      `json:"credentialKeyId"`
+	AdmissionKeyID     string      `json:"admissionKeyId"`
 	SCTPPort           int         `json:"sctpPort"`
 	MaxMessageSize     int         `json:"maxMessageSize"`
 	StatelessAdmission struct {
-		Capability  string `json:"capability"`
-		Assisted    string `json:"assisted,omitempty"`
-		Incarnation string `json:"incarnation"`
+		Capability       string `json:"capability"`
+		Incarnation      string `json:"incarnation"`
+		AssistedFamilies []int  `json:"assistedFamilies,omitempty"`
 	} `json:"statelessAdmission"`
 }
 
-type playerCount struct {
-	ConnectedPlayers int   `json:"connectedPlayers"`
-	SampledAt        int64 `json:"sampledAt"`
+type connectedPlayers struct {
+	Count     int   `json:"count"`
+	SampledAt int64 `json:"sampledAt"`
+}
+
+// Software identifies the host software reported to the provider.
+type Software struct {
+	// Name is the name of the host software, 1 to 64 characters.
+	Name string `json:"name"`
+	// Version is the version of the host software, 1 to 128 characters.
+	Version string `json:"version"`
+}
+
+func (s *Software) valid() bool {
+	return s.Name != "" && utf8.RuneCountInString(s.Name) <= 64 && s.Version != "" && utf8.RuneCountInString(s.Version) <= 128
+}
+
+// Location is where the operator says the host runs. It needs a Country, coordinates or both.
+type Location struct {
+	// Country is an uppercase ISO 3166-1 alpha-2 code.
+	Country string `json:"country,omitempty"`
+	// City is 1 to 120 characters without control characters.
+	City string `json:"city,omitempty"`
+	// Latitude (-90 to 90) and Longitude (-180 to 180) are set together.
+	Latitude  *float64 `json:"latitude,omitempty"`
+	Longitude *float64 `json:"longitude,omitempty"`
+}
+
+var countryPattern = regexp.MustCompile(`^[A-Z]{2}$`)
+
+func (l *Location) valid() bool {
+	if l.Country != "" && !countryPattern.MatchString(l.Country) {
+		return false
+	}
+	if l.City != "" && (utf8.RuneCountInString(l.City) > 120 || !utf8.ValidString(l.City) || strings.ContainsFunc(l.City, isControl)) {
+		return false
+	}
+	if (l.Latitude == nil) != (l.Longitude == nil) {
+		return false
+	}
+	if l.Latitude != nil && !(*l.Latitude >= -90 && *l.Latitude <= 90 && *l.Longitude >= -180 && *l.Longitude <= 180) {
+		return false
+	}
+	return l.Country != "" || l.Latitude != nil
 }
 
 // serverStatus is the public listing metadata of the host.
 type serverStatus struct {
-	Name       string `json:"name"`
-	Level      string `json:"level"`
-	Players    *int   `json:"players,omitempty"`
-	MaxPlayers int    `json:"maxPlayers"`
-	GameType   int    `json:"gameType"`
+	Name           string `json:"name"`
+	Level          string `json:"level"`
+	MaxPlayerCount int    `json:"maxPlayerCount"`
+	GameType       int    `json:"gameType"`
 }
 
 type heartbeatRequest struct {
-	AcceptingPlayers    bool                 `json:"acceptingPlayers"`
-	Capacity            int                  `json:"capacity"`
-	ClockUnixMillis     int64                `json:"clockUnixMillis"`
-	PlayerCount         *playerCount         `json:"playerCount,omitempty"`
-	Build               string               `json:"build,omitempty"`
-	ServerStatus        *serverStatus        `json:"serverStatus,omitempty"`
-	GameOutcomes        string               `json:"gameOutcomes,omitempty"`
-	HostProfile         *hostProfile         `json:"hostProfile,omitempty"`
-	HostProfileRevision string               `json:"hostProfileRevision,omitempty"`
-	InstalledKeyIDs     []string             `json:"installedKeyIds,omitempty"`
-	KeyRequestID        string               `json:"keyRequestId,omitempty"`
-	Extensions          map[string]extension `json:"extensions,omitempty"`
-	// AppliedStateRevision acknowledges the historic desired state of the provider.
-	AppliedStateRevision int64 `json:"appliedStateRevision"`
+	AcceptingPlayers         bool                 `json:"acceptingPlayers"`
+	Capacity                 int                  `json:"capacity"`
+	ConnectedPlayers         connectedPlayers     `json:"connectedPlayers"`
+	Software                 *Software            `json:"software,omitempty"`
+	Location                 json.RawMessage      `json:"location,omitempty"`
+	ServerStatus             *serverStatus        `json:"serverStatus,omitempty"`
+	GameOutcomes             string               `json:"gameOutcomes,omitempty"`
+	HostProfile              *hostProfile         `json:"hostProfile,omitempty"`
+	HostProfileRevision      string               `json:"hostProfileRevision,omitempty"`
+	InstalledAdmissionKeyIDs []string             `json:"installedAdmissionKeyIds,omitempty"`
+	AdmissionKeyRequestID    string               `json:"admissionKeyRequestId,omitempty"`
+	Extensions               map[string]extension `json:"extensions,omitempty"`
 }
 
 type checkIn struct {
-	Version                 int   `json:"version"`
 	AfterMillis             int64 `json:"afterMillis"`
-	NextCheckInAt           int64 `json:"nextCheckInAt"`
-	LeaseExpiresAt          int64 `json:"leaseExpiresAt"`
+	LeaseMillis             int64 `json:"leaseMillis"`
 	MinUpdateIntervalMillis int64 `json:"minUpdateIntervalMillis"`
 }
 
+func (c *checkIn) valid() bool {
+	return c.AfterMillis >= 1000 && c.AfterMillis <= 86400000 && c.LeaseMillis > c.AfterMillis && c.LeaseMillis-c.AfterMillis <= 300000 &&
+		c.MinUpdateIntervalMillis >= 1000 && c.MinUpdateIntervalMillis <= c.AfterMillis
+}
+
 type heartbeatResponse struct {
-	Accepted            bool      `json:"accepted"`
-	ReceivedAt          string    `json:"receivedAt"`
-	StaleAfter          string    `json:"staleAfter"`
-	HostProfileRevision *string   `json:"hostProfileRevision"`
-	ActiveKeyID         string    `json:"activeKeyId"`
-	LeaseGeneration     int64     `json:"leaseGeneration"`
-	Readiness           Readiness `json:"readiness"`
-	Retirements         []struct {
+	HostProfileRevision     *string   `json:"hostProfileRevision"`
+	Readiness               Readiness `json:"readiness"`
+	AdmissionKeyRetirements []struct {
 		KeyID       string `json:"keyId"`
 		RetireAfter int64  `json:"retireAfter"`
-	} `json:"retirements"`
-	CheckIn    *checkIn `json:"checkIn"`
-	KeyRequest *struct {
+	} `json:"admissionKeyRetirements"`
+	CheckIn             *checkIn `json:"checkIn"`
+	AdmissionKeyRequest *struct {
 		ID    string `json:"id"`
 		KeyID string `json:"keyId"`
-	} `json:"keyRequest"`
-	TicketKey    *ticketKey           `json:"ticketKey"`
-	Extensions   map[string]extension `json:"extensions"`
-	DesiredState *struct {
-		Revision int64  `json:"revision"`
-		State    string `json:"state"`
-	} `json:"desiredState"`
+	} `json:"admissionKeyRequest"`
+	AdmissionKey            *ticketKey           `json:"admissionKey"`
+	OperatorActionAvailable bool                 `json:"operatorActionAvailable"`
+	Extensions              map[string]extension `json:"extensions"`
 }
 
 // event is an outcome observation of an admission attempt.
 type event struct {
 	TicketID      string `json:"ticketId"`
 	Stage         string `json:"stage"`
-	OccurredAt    string `json:"occurredAt"`
+	OccurredAt    int64  `json:"occurredAt"`
 	Reason        string `json:"reason,omitempty"`
 	RemoteAddress string `json:"remoteAddress,omitempty"`
 	RemotePort    int    `json:"remotePort,omitempty"`
@@ -394,7 +395,145 @@ func normalizeOrigin(raw string) (string, error) {
 		}
 		host += ":" + port
 	}
-	return scheme + "://" + host, nil
+	origin := scheme + "://" + host
+	if !canonicalOrigin(origin) {
+		return "", fmt.Errorf("nxs: origin %q is not canonical", raw)
+	}
+	return origin, nil
+}
+
+var (
+	originAuthorityPattern = regexp.MustCompile(`^[a-z0-9.\[\]:-]+$`)
+	originPortPattern      = regexp.MustCompile(`^:[1-9][0-9]{0,4}$`)
+	dnsLabelPattern        = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	ipv4OctetPattern       = regexp.MustCompile(`^(?:0|[1-9][0-9]{0,2})$`)
+	ipv6PiecePattern       = regexp.MustCompile(`^(?:0|[1-9a-f][0-9a-f]{0,3})$`)
+)
+
+// canonicalOrigin reports whether value is a canonical origin as defined by the
+// specification, which accepts exactly one spelling of every origin.
+func canonicalOrigin(value string) bool {
+	secure := strings.HasPrefix(value, "https://")
+	if !secure && !strings.HasPrefix(value, "http://") {
+		return false
+	}
+	authority := strings.TrimPrefix(strings.TrimPrefix(value, "https://"), "http://")
+	if !originAuthorityPattern.MatchString(authority) {
+		return false
+	}
+	var host, port string
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		if end < 0 || !canonicalIPv6(authority[1:end]) {
+			return false
+		}
+		host, port = authority[:end+1], authority[end+1:]
+	} else {
+		host = authority
+		if i := strings.IndexByte(authority, ':'); i >= 0 {
+			host, port = authority[:i], authority[i:]
+		}
+		if !canonicalIPv4(host) && !canonicalDNS(host) {
+			return false
+		}
+	}
+	if port != "" {
+		n, _ := strconv.Atoi(port[1:])
+		if !originPortPattern.MatchString(port) || n > 65535 || (secure && n == 443) || (!secure && n == 80) {
+			return false
+		}
+	}
+	return secure || host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+}
+
+func canonicalIPv4(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, part := range parts {
+		if n, _ := strconv.Atoi(part); !ipv4OctetPattern.MatchString(part) || n > 255 {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalDNS(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if !dnsLabelPattern.MatchString(label) || strings.HasPrefix(label, "xn--") {
+			return false
+		}
+	}
+	// A numeric final label would make the host an IPv4 address to WHATWG URL parsers.
+	last := labels[len(labels)-1]
+	return last[0] >= 'a' && last[0] <= 'z'
+}
+
+// canonicalIPv6 reports whether s is an IPv6 address in shortest lowercase form, compressing
+// the first longest run of at least two zero pieces, without an IPv4 tail.
+func canonicalIPv6(s string) bool {
+	if s == "" || strings.ContainsFunc(s, func(r rune) bool { return !strings.ContainsRune("0123456789abcdef:", r) }) {
+		return false
+	}
+	pieces := func(s string) ([]uint16, bool) {
+		if s == "" {
+			return nil, true
+		}
+		var out []uint16
+		for _, v := range strings.Split(s, ":") {
+			n, err := strconv.ParseUint(v, 16, 16)
+			if err != nil || !ipv6PiecePattern.MatchString(v) {
+				return nil, false
+			}
+			out = append(out, uint16(n))
+		}
+		return out, len(out) <= 8
+	}
+	var all []uint16
+	if left, right, compressed := strings.Cut(s, "::"); !compressed {
+		p, ok := pieces(s)
+		if !ok || len(p) != 8 {
+			return false
+		}
+		all = p
+	} else {
+		l, okL := pieces(left)
+		r, okR := pieces(right)
+		zeros := 8 - len(l) - len(r)
+		if !okL || !okR || strings.Contains(right, "::") || zeros < 2 {
+			return false
+		}
+		all = append(append(l, make([]uint16, zeros)...), r...)
+	}
+	start, length := -1, 1
+	for i := 0; i < len(all); {
+		if all[i] != 0 {
+			i++
+			continue
+		}
+		j := i
+		for j < len(all) && all[j] == 0 {
+			j++
+		}
+		if j-i > length {
+			start, length = i, j-i
+		}
+		i = j
+	}
+	hexes := make([]string, len(all))
+	for i, v := range all {
+		hexes[i] = strconv.FormatUint(uint64(v), 16)
+	}
+	want := strings.Join(hexes, ":")
+	if start >= 0 {
+		want = strings.Join(hexes[:start], ":") + "::" + strings.Join(hexes[start+length:], ":")
+	}
+	return s == want
 }
 
 // operationURL checks that an operation URL is on the origin.

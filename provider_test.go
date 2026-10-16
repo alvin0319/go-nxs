@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -148,7 +149,7 @@ func statelessAnswer(f *fakeProvider, host netip.AddrPort, networkID uint64, bin
 		f.mu.Lock()
 		profile := f.profile
 		f.mu.Unlock()
-		key, _ := f.key(profile.CredentialKeyID)
+		key, _ := f.key(profile.AdmissionKeyID)
 		audience := admission.Audience(profile.StatelessAdmission.Incarnation)
 		c := admission.Claims{ExpiresAt: time.Unix(time.Now().Add(30*time.Second).Unix(), 0), SCTPPort: 5000, MaxMessageSize: 262144,
 			NetworkID: networkID, Password: pwd, Diagnostic: diag}
@@ -292,7 +293,7 @@ func TestPause(t *testing.T) {
 	p.Pause()
 	waitFor(t, func() bool {
 		hb := f.lastHeartbeat()
-		return !hb.AcceptingPlayers && hb.PlayerCount != nil && hb.PlayerCount.ConnectedPlayers == 1
+		return !hb.AcceptingPlayers && hb.ConnectedPlayers.Count == 1
 	})
 	if p.host.diagnosticsActive() {
 		t.Fatal("diagnostics should be disabled while paused")
@@ -339,7 +340,7 @@ func TestAssistedJoin(t *testing.T) {
 	waitFor(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return f.wsHeartbeats > 0 && f.profile.StatelessAdmission.Assisted == assistedCapability
+		return f.wsHeartbeats > 0 && len(f.profile.StatelessAdmission.AssistedFamilies) > 0
 	})
 
 	identity, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
@@ -352,7 +353,7 @@ func TestAssistedJoin(t *testing.T) {
 		defer cancel()
 		return f.assist(ctx, map[string]any{
 			"instanceId": "instance_1", "generation": gen, "incarnation": profile.StatelessAdmission.Incarnation,
-			"keyId": profile.CredentialKeyID, "hostFingerprint": profile.DTLSFingerprint,
+			"keyId": profile.AdmissionKeyID, "hostFingerprint": profile.DTLSFingerprint,
 			"expiresAt": time.Now().Add(20 * time.Second).UnixMilli(), "networkId": "43", "cpk": cpk,
 			"localUfrag": "assistedHostUfrag", "localPassword": "assistedHostPassword0123456789",
 			"offer": signal.Data,
@@ -450,6 +451,65 @@ func TestRecovery(t *testing.T) {
 	})
 }
 
+func TestRegistrationLost(t *testing.T) {
+	f := newFakeProvider(t)
+	p, _, _ := startProvider(t, f, Config{})
+	f.mu.Lock()
+	oldKey := f.pub
+	f.fence, f.forget = true, true
+	f.mu.Unlock()
+	waitFor(t, func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return !f.pub.Equal(oldKey) && f.generation == 2 && f.heartbeats[len(f.heartbeats)-1].HostProfile != nil
+	})
+	if p.NetworkID() != "instance_1" {
+		t.Fatalf("unexpected network ID %q", p.NetworkID())
+	}
+}
+
+func TestFenced(t *testing.T) {
+	f := newFakeProvider(t)
+	p, _, _ := startProvider(t, f, Config{WebSocket: true})
+	f.mu.Lock()
+	f.fenced = true
+	f.mu.Unlock()
+	waitFor(t, func() bool { return p.Context().Err() != nil })
+	if !errors.Is(context.Cause(p.Context()), ErrReplaced) {
+		t.Fatalf("unexpected cause %v", context.Cause(p.Context()))
+	}
+	f.mu.Lock()
+	before := f.fencedRequests
+	f.mu.Unlock()
+	_ = p.Close()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fencedRequests != before {
+		t.Fatalf("%d requests sent after the registration was fenced", f.fencedRequests-before)
+	}
+}
+
+func TestProfileRepublished(t *testing.T) {
+	f := newFakeProvider(t)
+	startProvider(t, f, Config{})
+	profiles := func() int {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		n := 0
+		for _, hb := range f.heartbeats {
+			if hb.HostProfile != nil {
+				n++
+			}
+		}
+		return n
+	}
+	published := profiles()
+	f.mu.Lock()
+	f.forgetProfile = true
+	f.mu.Unlock()
+	waitFor(t, func() bool { return profiles() > published })
+}
+
 func TestConnectivityFeedback(t *testing.T) {
 	f := newFakeProvider(t)
 	_, _, host := startProvider(t, f, Config{})
@@ -485,7 +545,7 @@ func TestAdmissionKeyRotation(t *testing.T) {
 	waitFor(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return f.profile.CredentialKeyID == "K002" && slices2(f.heartbeats[len(f.heartbeats)-1].InstalledKeyIDs, "K001", "K002")
+		return f.profile.AdmissionKeyID == "K002" && slices2(f.heartbeats[len(f.heartbeats)-1].InstalledAdmissionKeyIDs, "K001", "K002")
 	})
 }
 
@@ -531,13 +591,12 @@ func TestAssistedDiagnostic(t *testing.T) {
 		var data struct {
 			Diagnostics       bool  `json:"diagnostics"`
 			CandidateRevision int64 `json:"candidateRevision"`
-			AssistedFamilies  []int `json:"assistedFamilies"`
 		}
 		_ = json.Unmarshal(f.lastHeartbeat().Extensions[extensionConnectivity].Data, &data)
 		revision = data.CandidateRevision
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return data.Diagnostics && len(data.AssistedFamilies) == 1 && f.wsHeartbeats > 0
+		return data.Diagnostics && f.profile != nil && len(f.profile.StatelessAdmission.AssistedFamilies) == 1 && f.wsHeartbeats > 0
 	})
 
 	var attemptID [16]byte
@@ -546,15 +605,16 @@ func TestAssistedDiagnostic(t *testing.T) {
 		f.mu.Lock()
 		profile, gen := f.profile, f.generation
 		f.mu.Unlock()
-		key, _ := f.key(profile.CredentialKeyID)
+		key, _ := f.key(profile.AdmissionKeyID)
 		audience := admission.Audience(profile.StatelessAdmission.Incarnation)
-		fp, _ := hex.DecodeString(strings.ReplaceAll(strings.TrimPrefix(sdpField(signal.Data, "fingerprint"), "sha-256 "), ":", ""))
+		offer := diagnosticOffer(signal.Data)
+		fp, _ := hex.DecodeString(strings.ReplaceAll(strings.TrimPrefix(sdpField(offer, "fingerprint"), "sha-256 "), ":", ""))
 		c := admission.Claims{ExpiresAt: time.Unix(time.Now().Add(30*time.Second).Unix(), 0), SCTPPort: 5000, MaxMessageSize: 262144,
-			Password: sdpField(signal.Data, "ice-pwd"), IdentityBinding: attemptID,
-			Diagnostic: &admission.Diagnostic{OfferDigest: sha256.Sum256([]byte(signal.Data)), CandidateRevision: uint64(revision),
+			Password: sdpField(offer, "ice-pwd"), IdentityBinding: attemptID,
+			Diagnostic: &admission.Diagnostic{OfferDigest: sha256.Sum256([]byte(offer)), CandidateRevision: uint64(revision),
 				Profile: admission.ProfileAssisted, Target: netip.AddrPortFrom(netip.IPv4Unspecified(), 0)}}
 		copy(c.Fingerprint[:], fp)
-		token, err := key.Seal(audience, sdpField(signal.Data, "ice-ufrag"), c, [12]byte{1})
+		token, err := key.Seal(audience, sdpField(offer, "ice-ufrag"), c, [12]byte{1})
 		if err != nil {
 			return "", err
 		}
@@ -562,9 +622,9 @@ func TestAssistedDiagnostic(t *testing.T) {
 		defer cancel()
 		return f.assist(ctx, map[string]any{
 			"instanceId": "instance_1", "generation": gen, "incarnation": profile.StatelessAdmission.Incarnation,
-			"keyId": profile.CredentialKeyID, "hostFingerprint": profile.DTLSFingerprint,
-			"expiresAt": c.ExpiresAt.UnixMilli(), "networkId": "0",
-			"localUfrag": token, "localPassword": key.ICEPassword(audience, token), "offer": signal.Data,
+			"keyId": profile.AdmissionKeyID, "hostFingerprint": profile.DTLSFingerprint,
+			"expiresAt": c.ExpiresAt.UnixMilli(), "networkId": "0", "id": hex.EncodeToString(attemptID[:]),
+			"localUfrag": token, "localPassword": key.ICEPassword(audience, token), "offer": offer,
 		})
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -581,5 +641,91 @@ func TestAssistedDiagnostic(t *testing.T) {
 	pong, err := client.ReadPacket()
 	if err != nil || len(pong) != 55 || pong[5] != diagnosticPong {
 		t.Fatalf("unexpected PONG %x: %v", pong, err)
+	}
+}
+
+func diagnosticOffer(sdp string) string {
+	var lines []string
+	candidates := 0
+	for _, l := range strings.Split(strings.TrimSuffix(sdp, "\r\n"), "\r\n") {
+		if strings.HasPrefix(l, "a=candidate:") {
+			l = "a=candidate:" + strings.TrimPrefix(l, "a=candidate:candidate:")
+			if candidates++; candidates > 1 || !strings.Contains(l, " 127.0.0.1 ") {
+				candidates--
+				continue
+			}
+		}
+		if l != "a=end-of-candidates" {
+			lines = append(lines, l)
+		}
+	}
+	return strings.Join(lines, "\r\n") + "\r\na=end-of-candidates\r\n"
+}
+
+func TestOperatorAction(t *testing.T) {
+	f := newFakeProvider(t)
+	p, _, _ := startProvider(t, f, Config{})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if a, err := p.RequestOperatorAction(ctx); err != nil || a.URL != "https://claim.example/one-time" {
+		t.Fatalf("enrollment operator action not returned: %+v, %v", a, err)
+	}
+	var a *OperatorAction
+	waitFor(t, func() bool {
+		a, _ = p.RequestOperatorAction(ctx)
+		return a != nil && a.URL != "https://claim.example/one-time"
+	})
+	if a.URL != "https://claim.example/fresh" || a.Text != "Claim this server" || time.Until(a.ExpiresAt) < 50*time.Minute {
+		t.Fatalf("unexpected operator action %+v", a)
+	}
+	if again, err := p.RequestOperatorAction(ctx); err != nil || *again != *a {
+		t.Fatalf("valid operator action not reused: %+v, %v", again, err)
+	}
+}
+
+func heartbeatLocation(f *fakeProvider) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, hb := range f.heartbeats {
+		if hb.HostProfile != nil {
+			return string(hb.Location)
+		}
+	}
+	return ""
+}
+
+func TestLocation(t *testing.T) {
+	f := newFakeProvider(t)
+	startProvider(t, f, Config{})
+	if got := heartbeatLocation(f); got != "null" {
+		t.Fatalf("undeclared location: got %s", got)
+	}
+
+	lat, lon := 40.71, -74.01
+	f = newFakeProvider(t)
+	startProvider(t, f, Config{Location: &Location{Country: "US", City: "New York", Latitude: &lat, Longitude: &lon}})
+	if got := heartbeatLocation(f); got != `{"country":"US","city":"New York","latitude":40.71,"longitude":-74.01}` {
+		t.Fatalf("declared location: got %s", got)
+	}
+}
+
+func TestLocationValidation(t *testing.T) {
+	lat, lon, far := 40.71, -74.01, 91.0
+	for _, l := range []Location{
+		{City: "New York"},
+		{Country: "us"},
+		{Country: "USA"},
+		{Latitude: &lat},
+		{Latitude: &far, Longitude: &lon},
+		{Country: "US", City: "New York\n"},
+	} {
+		if l.valid() {
+			t.Errorf("location %+v accepted", l)
+		}
+	}
+	for _, l := range []Location{{Country: "US"}, {Latitude: &lat, Longitude: &lon}, {Country: "US", City: "New York", Latitude: &lat, Longitude: &lon}} {
+		if !l.valid() {
+			t.Errorf("location %+v rejected", l)
+		}
 	}
 }

@@ -35,9 +35,13 @@ func (p *Provider) run(ctx context.Context) {
 			p.refreshEndpoints(ctx)
 			nextEndpoints = now.Add(refreshInterval)
 		}
-		if !now.Before(next) || (p.dirty.Load() && !now.Before(nextUpdate)) {
+		if !now.Before(next) || p.urgent.Load() || (p.dirty.Load() && !now.Before(nextUpdate)) {
 			p.dirty.Store(false)
+			p.urgent.Store(false)
 			n, u, err := p.heartbeat(ctx)
+			if p.fenced.Load() {
+				return
+			}
 			if err != nil && recoverable(err) && ctx.Err() == nil {
 				p.opMu.Lock()
 				if rerr := p.recoverSession(ctx); rerr != nil {
@@ -104,23 +108,19 @@ func (p *Provider) exchange(ctx context.Context) (next, nextUpdate time.Time, ag
 	p.mu.Unlock()
 	capacity := p.conf.Capacity
 	if capacity == 0 && status != nil {
-		capacity = status.MaxPlayers
+		capacity = status.MaxPlayerCount
 	}
 	body := heartbeatRequest{
-		Capacity:            min(max(capacity, 0), 1000000),
-		PlayerCount:         &playerCount{ConnectedPlayers: p.host.sessionCount(), SampledAt: now.UnixMilli()},
-		Build:               p.conf.Build,
-		KeyRequestID:        st.KeyRequestID,
-		HostProfileRevision: p.profileRevision,
+		Capacity:              min(max(capacity, 0), 1000000),
+		ConnectedPlayers:      connectedPlayers{Count: min(p.host.sessionCount(), 1000000), SampledAt: now.UnixMilli()},
+		AdmissionKeyRequestID: st.KeyRequestID,
+		HostProfileRevision:   p.profileRevision,
 	}
 	body.AcceptingPlayers = !p.closing.Load() && p.host.accepting() && p.host.hasListener() && len(st.TicketKeys) > 0 && body.Capacity > 0
 	if status != nil {
 		s := *status
 		body.ServerStatus = &s
 	}
-	p.clock = max(now.UnixMilli(), p.clock+1)
-	body.ClockUnixMillis = p.clock
-	body.AppliedStateRevision = p.appliedState
 
 	var profile []byte
 	diagnostics := p.host.diagnosticsActive()
@@ -133,10 +133,10 @@ func (p *Provider) exchange(ctx context.Context) (next, nextUpdate time.Time, ag
 			body.HostProfile, body.HostProfileRevision = hp, ""
 		}
 		for _, k := range st.TicketKeys {
-			body.InstalledKeyIDs = append(body.InstalledKeyIDs, k.KeyID)
+			body.InstalledAdmissionKeyIDs = append(body.InstalledAdmissionKeyIDs, k.KeyID)
 		}
 		if p.disc.connectivity() {
-			data := map[string]any{"diagnostics": diagnostics, "candidateRevision": p.endpoints.revision, "method": p.method(), "assistedFamilies": p.assistedFamilies()}
+			data := map[string]any{"diagnostics": diagnostics, "candidateRevision": p.endpoints.revision, "method": p.method()}
 			if !slices.Equal(p.endpoints.all, p.endpoints.published) {
 				data["probeCandidates"] = nonNil(p.endpoints.all)
 			}
@@ -149,6 +149,16 @@ func (p *Provider) exchange(ctx context.Context) (next, nextUpdate time.Time, ag
 		if p.conf.GameOutcomes {
 			body.GameOutcomes = "available"
 		}
+		if p.conf.Software != nil && p.conf.Software.valid() {
+			body.Software = p.conf.Software
+		}
+		// An explicit null clears a location declared by an earlier run of this instance.
+		body.Location = json.RawMessage("null")
+		if p.conf.Location != nil {
+			if body.Location, err = json.Marshal(p.conf.Location); err != nil {
+				return next, nextUpdate, false, err
+			}
+		}
 	}
 
 	started := time.Now()
@@ -156,24 +166,34 @@ func (p *Provider) exchange(ctx context.Context) (next, nextUpdate time.Time, ag
 	if err := p.signed(ctx, "heartbeat", body, resp, 3, 15*time.Second); err != nil {
 		return next, nextUpdate, false, err
 	}
-	if !resp.Accepted {
-		return next, nextUpdate, false, errors.New("nxs: heartbeat not accepted")
+	if resp.CheckIn != nil && !resp.CheckIn.valid() {
+		return next, nextUpdate, false, errors.New("nxs: heartbeat schedule out of bounds")
 	}
-	p.outcomesReported = true
-	if body.HostProfile != nil {
-		if resp.HostProfileRevision == nil || *resp.HostProfileRevision == "" {
-			return next, nextUpdate, false, errors.New("nxs: host profile not acknowledged")
-		}
-		p.profileRevision, p.lastProfile = *resp.HostProfileRevision, profile
-	}
-	if again, err = p.handleKeys(resp); err != nil {
+	if err := checkExtensions(resp.Extensions); err != nil {
 		return next, nextUpdate, false, err
 	}
-	p.applyFeedback(resp.Extensions)
-	// Acknowledging the historic desired state never controls the listener.
-	if d := resp.DesiredState; d != nil && d.State == "serving" && d.Revision >= p.appliedState && d.Revision <= 1<<53-1 {
-		p.appliedState = d.Revision
+	rev := resp.HostProfileRevision
+	if rev != nil && len(*rev) > 184 {
+		return next, nextUpdate, false, errors.New("nxs: host profile revision too long")
 	}
+	p.outcomesReported, p.operatorActionAvailable = true, resp.OperatorActionAvailable
+	switch {
+	case body.HostProfile != nil:
+		if rev == nil || *rev == "" {
+			return next, nextUpdate, false, errors.New("nxs: provider did not acknowledge the host profile")
+		}
+		p.profileRevision, p.lastProfile = *rev, profile
+	case p.profileRevision != "" && (rev == nil || *rev != p.profileRevision):
+		// The provider no longer holds the published profile, so it is sent again in full.
+		p.profileRevision, p.lastProfile = "", nil
+		again = len(st.TicketKeys) > 0
+	}
+	keysChanged, err := p.handleKeys(resp)
+	if err != nil {
+		return next, nextUpdate, false, err
+	}
+	again = again || keysChanged
+	p.applyFeedback(resp.Extensions)
 	if len(st.TicketKeys) > 0 && !p.closing.Load() {
 		p.authority.Store(&authority{instanceID: st.Registration.InstanceID, generation: st.Generation, keyID: st.TicketKeys[len(st.TicketKeys)-1].KeyID})
 	}
@@ -189,19 +209,10 @@ func (p *Provider) exchange(ctx context.Context) (next, nextUpdate time.Time, ag
 	interval := time.Duration(p.disc.Limits.HeartbeatIntervalMs) * time.Millisecond
 	next, nextUpdate = started.Add(interval), started.Add(interval)
 	lease := time.Time{}
-	if c := resp.CheckIn; c != nil && c.Version == 1 && c.AfterMillis >= 1000 {
-		after := time.Duration(c.AfterMillis) * time.Millisecond
-		remaining := after
-		if received, err := time.Parse(time.RFC3339Nano, resp.ReceivedAt); err == nil {
-			until := time.Duration(c.NextCheckInAt-max(received.UnixMilli(), time.Now().UnixMilli())) * time.Millisecond
-			remaining = min(after, max(0, until))
-		}
-		next = started.Add(after)
-		if t := time.Now().Add(remaining); t.Before(next) {
-			next = t
-		}
-		nextUpdate = time.Now().Add(time.Duration(c.MinUpdateIntervalMillis) * time.Millisecond)
-		lease = time.UnixMilli(c.LeaseExpiresAt)
+	if c := resp.CheckIn; c != nil {
+		next = started.Add(time.Duration(c.AfterMillis) * time.Millisecond)
+		nextUpdate = started.Add(time.Duration(c.MinUpdateIntervalMillis) * time.Millisecond)
+		lease = started.Add(time.Duration(c.LeaseMillis) * time.Millisecond)
 	}
 
 	if p.conf.Diagnostics && body.AcceptingPlayers {
@@ -213,7 +224,34 @@ func (p *Provider) exchange(ctx context.Context) (next, nextUpdate time.Time, ag
 	} else {
 		p.host.setDiagnostics(nil)
 	}
+	// Check in before the diagnostic policy and the assisted join authorization lapse, which a
+	// long check-in interval would otherwise let happen.
+	if pol := p.host.diagnostics.Load(); pol != nil {
+		next = earlier(next, later(nextUpdate, renewBefore(pol.expires)))
+	}
+	if p.ws.authorized() {
+		next = earlier(next, later(nextUpdate, renewBefore(p.ws.authorizedUntil())))
+	}
 	return next, nextUpdate, again, nil
+}
+
+// renewBefore returns when to renew an authorization that expires at deadline.
+func renewBefore(deadline time.Time) time.Time {
+	return deadline.Add(-min(time.Minute, time.Until(deadline)/5))
+}
+
+func earlier(a, b time.Time) time.Time {
+	if b.Before(a) {
+		return b
+	}
+	return a
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // hostProfile returns the current host profile. opMu must be held.
@@ -222,13 +260,13 @@ func (p *Provider) hostProfile() *hostProfile {
 	hp := &hostProfile{
 		Candidates:      nonNil(p.endpoints.published),
 		DTLSFingerprint: p.host.fingerprint,
-		CredentialKeyID: keys[len(keys)-1].KeyID,
+		AdmissionKeyID:  keys[len(keys)-1].KeyID,
 		SCTPPort:        sctpPort,
 		MaxMessageSize:  maxMessageSize,
 	}
 	hp.StatelessAdmission.Capability, hp.StatelessAdmission.Incarnation = Capability, p.host.incarnation
 	if p.assisting() {
-		hp.StatelessAdmission.Assisted = assistedCapability
+		hp.StatelessAdmission.AssistedFamilies = p.assistedFamilies()
 	}
 	return hp
 }
@@ -263,16 +301,16 @@ func (p *Provider) maintainKeys(now time.Time) error {
 func (p *Provider) handleKeys(resp *heartbeatResponse) (again bool, err error) {
 	st := p.st
 	switch {
-	case resp.TicketKey != nil:
-		k := resp.TicketKey
-		if st.KeyRequestID == "" || resp.KeyRequest == nil || resp.KeyRequest.ID != st.KeyRequestID || resp.KeyRequest.KeyID != k.KeyID {
+	case resp.AdmissionKey != nil:
+		k := resp.AdmissionKey
+		if st.KeyRequestID == "" || resp.AdmissionKeyRequest == nil || resp.AdmissionKeyRequest.ID != st.KeyRequestID || resp.AdmissionKeyRequest.KeyID != k.KeyID {
 			return false, errors.New("nxs: unbound admission key")
 		}
 		if !(admission.Key{ID: k.KeyID, Secret: k.Secret}).Valid() || len(st.TicketKeys) >= 8 ||
 			slices.ContainsFunc(st.TicketKeys, func(t ticketKey) bool { return t.KeyID == k.KeyID }) {
 			return false, errors.New("nxs: invalid admission key")
 		}
-		st.TicketKeys = append(st.TicketKeys, *k)
+		st.TicketKeys = append(st.TicketKeys, ticketKey{KeyID: k.KeyID, Secret: k.Secret})
 		st.KeyRequestID = ""
 		if err := p.store.save(st); err != nil {
 			return false, err
@@ -280,7 +318,7 @@ func (p *Provider) handleKeys(resp *heartbeatResponse) (again bool, err error) {
 		p.host.setKeys(st.keys())
 		p.log.Debug("installed admission key", "keyID", k.KeyID)
 		again = true
-	case st.KeyRequestID != "" && resp.KeyRequest != nil && resp.KeyRequest.ID == st.KeyRequestID:
+	case st.KeyRequestID != "" && resp.AdmissionKeyRequest != nil && resp.AdmissionKeyRequest.ID == st.KeyRequestID:
 		// The key was delivered but its one-time response was lost.
 		st.KeyRequestID = randomID()
 		if err := p.store.save(st); err != nil {
@@ -288,9 +326,9 @@ func (p *Provider) handleKeys(resp *heartbeatResponse) (again bool, err error) {
 		}
 		again = true
 	}
-	if len(resp.Retirements) > 0 {
+	if len(resp.AdmissionKeyRetirements) > 0 {
 		changed := false
-		for _, r := range resp.Retirements {
+		for _, r := range resp.AdmissionKeyRetirements {
 			for i, k := range st.TicketKeys {
 				// Repeated replies cannot extend the life of a key.
 				if k.KeyID == r.KeyID && (k.RetireAfter == 0 || r.RetireAfter < k.RetireAfter) {

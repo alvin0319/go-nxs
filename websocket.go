@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -52,43 +55,32 @@ type controlSocket struct {
 }
 
 type wsReply struct {
+	Kind    string            `json:"kind"`
 	ID      string            `json:"id"`
 	Status  int               `json:"status"`
 	Headers map[string]string `json:"headers"`
 	Body    string            `json:"body"`
 }
 
-// newControlSocket returns the WebSocket transport advertised by discovery, or nil.
+// newControlSocket returns the WebSocket transport if discovery advertises it, or nil. The
+// endpoint is fixed at /v1/nxs/control on the provider origin.
 func newControlSocket(p *Provider) (*controlSocket, error) {
 	ext, ok := p.disc.Extensions[extensionWebSocket]
 	if !ok || ext.Version != 1 {
 		return nil, nil
 	}
-	var data struct {
-		URL         string `json:"url"`
-		Subprotocol string `json:"subprotocol"`
-	}
-	if err := json.Unmarshal(ext.Data, &data); err != nil {
-		return nil, fmt.Errorf("nxs: decode WebSocket extension: %w", err)
-	}
-	u, err := url.Parse(data.URL)
+	u, err := url.Parse(p.origin)
 	if err != nil {
-		return nil, fmt.Errorf("nxs: parse WebSocket URL: %w", err)
+		return nil, err
 	}
-	scheme := map[string]string{"ws": "http", "wss": "https"}[u.Scheme]
-	if o, err := normalizeOrigin(scheme + "://" + u.Host); err != nil || o != p.origin || u.Path != "/v1/nxs/control" ||
-		u.RawQuery != "" || u.Fragment != "" || u.User != nil || data.Subprotocol != Protocol {
-		return nil, errors.New("nxs: unsupported WebSocket extension")
-	}
-	return &controlSocket{p: p, url: data.URL}, nil
+	u.Scheme = map[string]string{"http": "ws", "https": "wss"}[u.Scheme]
+	u.Path = "/v1/nxs/control"
+	return &controlSocket{p: p, url: u.String()}, nil
 }
 
 // carrier returns a request carrier for the operation, or nil if it is not carried.
 func (s *controlSocket) carrier(op string) func(context.Context, http.Header, []byte) (int, http.Header, []byte, error) {
 	if s == nil {
-		return nil
-	}
-	if u, err := url.Parse(s.p.disc.Operations[op]); err != nil || u.Path != "/v1/nxs/"+op || u.RawQuery != "" {
 		return nil
 	}
 	for _, name := range wsOperations {
@@ -111,7 +103,7 @@ func (s *controlSocket) exchange(ctx context.Context, op string, h http.Header, 
 	for _, name := range authHeaders {
 		headers[name] = h.Get(name)
 	}
-	frame, err := marshal(map[string]any{"operation": op, "headers": headers, "body": string(body)})
+	frame, err := marshal(map[string]any{"kind": "operation", "operation": op, "headers": headers, "body": string(body)})
 	if err != nil || len(frame) > maxFrameBytes {
 		return 0, nil, nil, errNoSocket
 	}
@@ -224,15 +216,33 @@ func (s *controlSocket) read(conn *websocket.Conn) {
 		var kind struct {
 			Kind string `json:"kind"`
 		}
-		if json.Unmarshal(b, &kind) == nil && kind.Kind == "assisted-join" {
-			go s.assist(conn, b)
+		if err := json.Unmarshal(b, &kind); err != nil || kind.Kind == "" {
+			s.violation(conn, "frame without kind")
+			return
+		}
+		switch kind.Kind {
+		case "assisted-join":
+			j, err := decodeAssistedJoin(b)
+			if err != nil {
+				s.violation(conn, "invalid assisted join frame")
+				return
+			}
+			s.mu.Lock()
+			bound := s.conn == conn && s.binding == j.InstanceID+":"+fmt.Sprint(j.Generation)
+			s.mu.Unlock()
+			if !bound {
+				s.violation(conn, "assisted join for another registration")
+				return
+			}
+			go s.assist(conn, j)
+			continue
+		case "response":
+		default:
 			continue
 		}
-		var r wsReply
-		dec := json.NewDecoder(bytes.NewReader(b))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&r); err != nil || len(r.Headers) > 32 || len(r.Body) > 65536 {
-			s.lost(conn, errors.New("invalid response envelope"))
+		r, err := decodeReply(b)
+		if err != nil {
+			s.violation(conn, "invalid response frame")
 			return
 		}
 		s.mu.Lock()
@@ -277,23 +287,21 @@ func (s *controlSocket) keepAlive(conn *websocket.Conn, done chan struct{}) {
 }
 
 // assist answers an assisted join over the connection it arrived on.
-func (s *controlSocket) assist(conn *websocket.Conn, b []byte) {
-	var id struct {
-		ID string `json:"id"`
-	}
-	_ = json.Unmarshal(b, &id)
-	result := map[string]any{"kind": "assisted-join-result", "id": id.ID, "accepted": false}
+func (s *controlSocket) assist(conn *websocket.Conn, j *assistedJoin) {
+	result := map[string]any{"kind": "assisted-join-result", "id": j.ID, "accepted": false}
 	switch {
 	case s.assisted.Add(1) > maxAssisted:
 		s.p.log.Warn("rejected assisted join: too many in flight")
 	case !s.authorized():
 		s.p.log.Warn("rejected assisted join: no recent heartbeat over the WebSocket")
+	case time.UnixMilli(j.ExpiresAt).After(s.authorizedUntil()):
+		s.p.log.Warn("rejected assisted join: it outlives the authorization of assisted joins")
 	default:
-		if answer, deadline, err := s.p.assist(b); err != nil {
+		if answer, deadline, err := s.p.assist(s.retirement(conn, j), j); err != nil {
 			s.p.log.Warn("assisted join failed", "error", err)
 		} else if time.Now().Before(deadline) {
 			result["accepted"], result["answer"] = true, answer
-			s.p.log.Debug("answered assisted join", "id", id.ID)
+			s.p.log.Debug("answered assisted join", "id", j.ID)
 		}
 	}
 	s.assisted.Add(-1)
@@ -308,9 +316,134 @@ func (s *controlSocket) assist(conn *websocket.Conn, b []byte) {
 	}
 }
 
+// retirement returns a context for the peer of an assisted join that arrived on conn. It is
+// canceled once conn is no longer the current connection or no longer authorizes assisted
+// joins, and at the latest when the peer would have timed out anyway.
+func (s *controlSocket) retirement(conn *websocket.Conn, j *assistedJoin) context.Context {
+	ctx, cancel := context.WithDeadline(context.Background(), time.UnixMilli(j.ExpiresAt).Add(admitTimeout))
+	s.mu.Lock()
+	done := s.done
+	if s.conn != conn {
+		cancel()
+	}
+	s.mu.Unlock()
+	go func() {
+		defer cancel()
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for s.authorized() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-t.C:
+			}
+		}
+	}()
+	return ctx
+}
+
+var (
+	replyIDPattern     = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+	headerNamePattern  = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
+	replyFields        = []string{"kind", "id", "status", "headers", "body"}
+	errDuplicateMember = errors.New("duplicate member")
+)
+
+// decodeReply decodes a response frame of the closed WebSocket reply envelope.
+func decodeReply(b []byte) (wsReply, error) {
+	var (
+		r      wsReply
+		fields map[string]json.RawMessage
+	)
+	if err := checkDuplicates(b); err != nil {
+		return r, err
+	}
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return r, err
+	}
+	for _, name := range replyFields {
+		if _, ok := fields[name]; !ok {
+			return r, fmt.Errorf("missing %s", name)
+		}
+	}
+	if err := json.Unmarshal(b, &r); err != nil {
+		return r, err
+	}
+	if !replyIDPattern.MatchString(r.ID) || r.Status < 200 || r.Status > 599 || len(r.Headers) > 32 || len(r.Body) > maxBodyBytes {
+		return r, errors.New("invalid response envelope")
+	}
+	seen := make(map[string]bool, len(r.Headers))
+	for name, value := range r.Headers {
+		lower := strings.ToLower(name)
+		if !headerNamePattern.MatchString(name) || seen[lower] || len(value) > 1024 || strings.ContainsFunc(value, func(c rune) bool { return c < 0x20 || c == 0x7f }) {
+			return r, errors.New("invalid response header")
+		}
+		seen[lower] = true
+	}
+	return r, nil
+}
+
+// checkDuplicates rejects JSON with an object that repeats a member name.
+func checkDuplicates(b []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	type frame struct {
+		object bool
+		key    bool
+		names  map[string]bool
+	}
+	var stack []*frame
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		var top *frame
+		if len(stack) > 0 {
+			top = stack[len(stack)-1]
+		}
+		switch tok {
+		case json.Delim('{'), json.Delim('['):
+			if top != nil && top.object {
+				top.key = true
+			}
+			stack = append(stack, &frame{object: tok == json.Delim('{'), key: true, names: map[string]bool{}})
+			continue
+		case json.Delim('}'), json.Delim(']'):
+			stack = stack[:len(stack)-1]
+			continue
+		}
+		if top == nil || !top.object {
+			continue
+		}
+		if top.key {
+			name := tok.(string)
+			if top.names[name] {
+				return errDuplicateMember
+			}
+			top.names[name] = true
+		}
+		top.key = !top.key
+	}
+}
+
+// violation closes conn with the policy violation status for a malformed frame.
+func (s *controlSocket) violation(conn *websocket.Conn, reason string) {
+	_ = conn.Close(websocket.StatusPolicyViolation, reason)
+	s.lost(conn, errors.New(reason))
+}
+
 // authorized reports whether a recent heartbeat over the connection authorizes assisted joins.
 func (s *controlSocket) authorized() bool {
-	return s != nil && time.Since(time.Unix(0, s.heartbeatAt.Load())) < assistedTimeout
+	return s != nil && time.Now().Before(s.authorizedUntil())
+}
+
+// authorizedUntil returns when the authorization of assisted joins lapses.
+func (s *controlSocket) authorizedUntil() time.Time {
+	return time.Unix(0, s.heartbeatAt.Load()).Add(assistedTimeout)
 }
 
 // lost drops conn if it is the current connection.

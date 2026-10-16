@@ -35,6 +35,8 @@ const (
 	sctpPort       = 5000
 	maxMessageSize = 262144
 	admitTimeout   = 20 * time.Second
+	// maxUsedTokens bounds the used-token records, which are kept until their token expires.
+	maxUsedTokens = 8192
 )
 
 // host accepts stateless admissions on the gameplay socket.
@@ -86,6 +88,8 @@ type attempt struct {
 	first []byte
 	// connectionID identifies the Conn of the attempt.
 	connectionID uint64
+	// ctx, if set, stops the attempt before its Conn is established once it is canceled.
+	ctx context.Context
 	// outcome is set once a game outcome has been reported.
 	outcome atomic.Bool
 }
@@ -239,7 +243,7 @@ func (h *host) handleUnhandled(data []byte, addr netip.AddrPort) {
 		h.log.Debug("rejected invalid admission token", "addr", addr)
 		return
 	}
-	if !claims.ExpiresAt.After(now) || claims.ExpiresAt.Sub(now) > h.maxTTL {
+	if !fresh(claims.ExpiresAt, now, h.maxTTL) {
 		h.log.Debug("rejected expired admission token", "addr", addr)
 		return
 	}
@@ -254,18 +258,30 @@ func (h *host) handleUnhandled(data []byte, addr netip.AddrPort) {
 		return
 	}
 
-	a, ok := h.reserve(token, addr, claims.ExpiresAt, msg.Raw)
-	if !ok {
+	a, reason := h.reserve(token, addr, claims.ExpiresAt, msg.Raw)
+	if a == nil {
+		if reason != "" {
+			h.log.Debug("rejected admission", "addr", addr, "reason", reason)
+			h.emit(&attempt{ticketID: admission.TicketID(token)}, "ticket.failed", reason, nil)
+		}
 		return
 	}
 	h.emit(a, "ticket.ice_seen", "token_and_stun_validated", nil)
 	go h.establish(a, nethernet.Admission{
-		NetworkID:       strconv.FormatUint(claims.NetworkID, 10),
-		ICE:             webrtc.ICEParameters{UsernameFragment: clientUfrag, Password: claims.Password},
-		DTLS:            remoteDTLS(claims.Fingerprint[:]),
-		SCTP:            webrtc.SCTPCapabilities{MaxMessageSize: claims.MaxMessageSize},
-		VerifyPublicKey: h.verifier(a, key, claims),
+		NetworkID: strconv.FormatUint(claims.NetworkID, 10),
+		ICE:       webrtc.ICEParameters{UsernameFragment: clientUfrag, Password: claims.Password},
+		DTLS:      remoteDTLS(claims.Fingerprint[:]),
+		SCTP:      webrtc.SCTPCapabilities{MaxMessageSize: claims.MaxMessageSize},
+		VerifyPublicKey: h.verifier(a, claims.ExpiresAt, func(pub *ecdsa.PublicKey) bool {
+			return key.VerifyBinding(h.audience, pub, claims.IdentityBinding)
+		}),
 	}, password)
+}
+
+// fresh reports whether a token expiring at expiresAt may be admitted at now: it has not
+// expired, and does not expire further ahead than maxTTL.
+func fresh(expiresAt, now time.Time, maxTTL time.Duration) bool {
+	return expiresAt.After(now) && expiresAt.Sub(now) <= maxTTL
 }
 
 // remoteDTLS returns the DTLS parameters of a client with the certificate fingerprint.
@@ -277,8 +293,10 @@ func remoteDTLS(fingerprint []byte) webrtc.DTLSParameters {
 	}
 }
 
-// reserve reserves an admission, rejecting replays and conflicting tuples.
-func (h *host) reserve(token string, addr netip.AddrPort, expiry time.Time, first []byte) (*attempt, bool) {
+// reserve reserves an admission, rejecting replays and conflicting tuples. A rejected
+// admission returns the reason it is reported with, which is empty for a retransmission or
+// replay of a token already seen.
+func (h *host) reserve(token string, addr netip.AddrPort, expiry time.Time, first []byte) (*attempt, string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	now := time.Now()
@@ -288,19 +306,33 @@ func (h *host) reserve(token string, addr netip.AddrPort, expiry time.Time, firs
 		}
 	}
 	if _, ok := h.used[token]; ok {
-		// Either a retransmission of a pending attempt or a replay.
-		return nil, false
+		return nil, ""
 	}
-	if _, ok := h.tuples[addr]; ok || !h.open() || h.pending >= h.maxPending || (h.maxSessions > 0 && len(h.sessions)+h.pending >= h.maxSessions) {
-		return nil, false
+	if len(h.used) >= maxUsedTokens {
+		// Evicting records would allow replays, so new admissions are rejected instead.
+		return nil, "capacity"
+	}
+	reason := ""
+	_, occupied := h.tuples[addr]
+	switch {
+	case !h.open():
+		reason = "not_accepting"
+	case occupied:
+		reason = "tuple_in_use"
+	case h.pending >= h.maxPending || (h.maxSessions > 0 && len(h.sessions)+h.pending >= h.maxSessions):
+		reason = "capacity"
+	}
+	// A rejected token is recorded too, so that its retransmissions are not reported again.
+	h.used[token] = expiry
+	if reason != "" {
+		return nil, reason
 	}
 	a := &attempt{token: token, ticketID: admission.TicketID(token), tuple: addr, first: first}
-	h.used[token] = expiry
 	if addr.IsValid() {
 		h.tuples[addr] = a
 	}
 	h.pending++
-	return a, true
+	return a, ""
 }
 
 // establish admits the connection of a reserved attempt into the listener, using password
@@ -340,7 +372,11 @@ func (h *host) connect(a *attempt, adm nethernet.Admission, password string, tim
 	if l == nil {
 		return nil, errNoListener
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	parent := a.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	settings := h.settings
@@ -354,16 +390,9 @@ func (h *host) connect(a *attempt, adm nethernet.Admission, password string, tim
 	adm.Certificates = []webrtc.Certificate{h.cert}
 	var replay sync.Once
 	adm.OnICEStateChange = func(state webrtc.ICETransportState) {
-		switch state {
-		case webrtc.ICETransportStateChecking:
-			if a.first != nil {
-				// The agent can only answer the retained request once it has started.
-				replay.Do(func() { h.conn.inject(a.first, a.tuple) })
-			}
-		case webrtc.ICETransportStateConnected:
-			if !adm.Detached {
-				h.emit(a, "ticket.ice_connected", "", nil)
-			}
+		if state == webrtc.ICETransportStateChecking && a.first != nil {
+			// The agent can only answer the retained request once it has started.
+			replay.Do(func() { h.conn.inject(a.first, a.tuple) })
 		}
 	}
 	conn, err := (*l).Admit(ctx, adm)
@@ -408,16 +437,17 @@ func (h *host) fail(a *attempt, reason string, err error) {
 }
 
 func (h *host) emit(a *attempt, stage, reason string, remote *netip.AddrPort) {
-	e := event{TicketID: a.ticketID, Stage: stage, OccurredAt: time.Now().UTC().Format(time.RFC3339Nano), Reason: reason}
+	e := event{TicketID: a.ticketID, Stage: stage, OccurredAt: time.Now().UnixMilli(), Reason: reason}
 	if remote != nil {
 		e.RemoteAddress, e.RemotePort = remote.Addr().String(), int(remote.Port())
 	}
 	h.report(e)
 }
 
-// verifier returns a one-shot check of the login identity key against the admission.
-func (h *host) verifier(a *attempt, key admission.Key, claims admission.Claims) func(*ecdsa.PublicKey) error {
-	deadline := time.Now().Add(time.Until(claims.ExpiresAt))
+// verifier returns a one-shot check of the login identity key against the admission, which
+// the player must log in with before expiresAt.
+func (h *host) verifier(a *attempt, expiresAt time.Time, matches func(*ecdsa.PublicKey) bool) func(*ecdsa.PublicKey) error {
+	deadline := time.Now().Add(time.Until(expiresAt))
 	var used atomic.Bool
 	return func(pub *ecdsa.PublicKey) error {
 		if used.Swap(true) {
@@ -426,7 +456,7 @@ func (h *host) verifier(a *attempt, key admission.Key, claims admission.Claims) 
 		var err error
 		if time.Now().After(deadline) {
 			err = errors.New("nxs: admission expired before login")
-		} else if !key.VerifyBinding(h.audience, pub, claims.IdentityBinding) {
+		} else if !matches(pub) {
 			err = errors.New("nxs: login identity does not match admission")
 		}
 		if err != nil && h.gameOutcomes && !a.outcome.Swap(true) {

@@ -52,7 +52,8 @@ const (
 type Key struct {
 	// ID is the four-character epoch ID.
 	ID string
-	// Secret is the UTF-8 secret of 32 to 256 bytes.
+	// Secret is 32 random bytes in 43 characters of unpadded base64url. Derivations use the
+	// ASCII bytes of this string, not its decoding.
 	Secret string
 	// NotBefore and RetireAfter bound the use of the key. Zero values are unbounded.
 	NotBefore, RetireAfter time.Time
@@ -60,7 +61,11 @@ type Key struct {
 
 // Valid reports whether k is well-formed.
 func (k Key) Valid() bool {
-	return keyIDPattern.MatchString(k.ID) && len(k.Secret) >= 32 && len(k.Secret) <= 256
+	if !keyIDPattern.MatchString(k.ID) || len(k.Secret) != 43 {
+		return false
+	}
+	b, err := base64.RawURLEncoding.Strict().DecodeString(k.Secret)
+	return err == nil && len(b) == 32 && base64.RawURLEncoding.EncodeToString(b) == k.Secret
 }
 
 // Usable reports whether k may admit tokens at t.

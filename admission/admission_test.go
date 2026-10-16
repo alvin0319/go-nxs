@@ -112,13 +112,14 @@ func TestRejections(t *testing.T) {
 		key                     Key
 		audience, token, client string
 	}{
-		"tampered-ciphertext": {key, f.Context.Audience, string(tampered), f.ClientIceUfrag},
-		"wrong-host":          {key, "nxs-stateless-host-v1/ffffffffffffffffffffffffffffffff", token, f.ClientIceUfrag},
-		"wrong-key":           {Key{ID: key.ID, Secret: key.Secret + "x"}, f.Context.Audience, token, f.ClientIceUfrag},
-		"wrong-key-id":        {Key{ID: "K002", Secret: key.Secret}, f.Context.Audience, token, f.ClientIceUfrag},
-		"wrong-client-ufrag":  {key, f.Context.Audience, token, "otherClientUfrag"},
-		"noncanonical-base64": {key, f.Context.Audience, token[:len(token)-1] + "r", f.ClientIceUfrag},
-		"padding":             {key, f.Context.Audience, token + "=", f.ClientIceUfrag},
+		"tampered-ciphertext":       {key, f.Context.Audience, string(tampered), f.ClientIceUfrag},
+		"wrong-host":                {key, "nxs-stateless-host-v1/ffffffffffffffffffffffffffffffff", token, f.ClientIceUfrag},
+		"wrong-profile-incarnation": {key, Audience("0123456789abcdef0123456789abcdee"), token, f.ClientIceUfrag},
+		"wrong-key":                 {Key{ID: key.ID, Secret: key.Secret + "x"}, f.Context.Audience, token, f.ClientIceUfrag},
+		"wrong-key-id":              {Key{ID: "K002", Secret: key.Secret}, f.Context.Audience, token, f.ClientIceUfrag},
+		"wrong-client-ufrag":        {key, f.Context.Audience, token, "otherClientUfrag"},
+		"noncanonical-base64":       {key, f.Context.Audience, token[:len(token)-1] + "r", f.ClientIceUfrag},
+		"padding":                   {key, f.Context.Audience, token + "=", f.ClientIceUfrag},
 	}
 	for name, c := range cases {
 		if _, err := c.key.Open(c.audience, c.token, c.client); err == nil {
@@ -145,6 +146,23 @@ func TestExpiryAndBudget(t *testing.T) {
 	claims.ExpiresAt = time.Unix(0, 0)
 	if _, err := key.Seal(f.Context.Audience, f.ClientIceUfrag, claims, [12]byte{}); err == nil {
 		t.Fatal("expected Seal to refuse a zero expiry")
+	}
+}
+
+func TestKeySecretFormat(t *testing.T) {
+	_, key, _ := loadFixture(t)
+	if !key.Valid() {
+		t.Fatal("fixture key rejected")
+	}
+	for _, secret := range []string{
+		"stateless-fixture-secret-32-bytes-minimum",
+		key.Secret + "A",
+		key.Secret[:42] + "B",
+		strings.Replace(key.Secret, "A", "+", 1),
+	} {
+		if (Key{ID: key.ID, Secret: secret}).Valid() {
+			t.Errorf("secret %q accepted", secret)
+		}
 	}
 }
 

@@ -21,9 +21,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/df-mc/go-nethernet"
 )
@@ -35,15 +38,12 @@ type Config struct {
 	// StateDir is the directory holding the durable state of this instance, including its
 	// machine key and admission keys. Each instance needs its own directory.
 	StateDir string
-	// Token is the bearer token used to register this instance. If empty, the instance is
-	// registered anonymously with proof of work, if the provider allows it.
+	// Token is the bearer token used to register this instance. The provider decides from it
+	// whether the instance creates a service or attaches to an existing one. If empty, the
+	// instance is registered anonymously with proof of work, if the provider allows it.
 	Token string
-	// Mode is the registration mode. It defaults to ModeAutomatic.
-	Mode string
-	// Label is an optional label for a new registration.
+	// Label is an optional display name for a new registration.
 	Label string
-	// Placement is the optional region and pool of the instance.
-	Placement *Placement
 
 	// Address is the UDP address that players connect to. It defaults to ":0", which
 	// should only be used if the port is reachable through STUN mappings.
@@ -54,8 +54,11 @@ type Config struct {
 	// Capacity is the maximum number of players admitted. If zero, the maximum player
 	// count of the listener is used.
 	Capacity int
-	// Build is an optional build identifier reported to the provider.
-	Build string
+	// Software optionally identifies the host software to the provider.
+	Software *Software
+	// Location optionally declares where the host runs. Without it, the provider estimates
+	// the location from the connection.
+	Location *Location
 
 	// WebSocket enables the WebSocket control transport if the provider advertises it.
 	// Operations fall back to HTTPS while it is unavailable.
@@ -95,7 +98,9 @@ type Provider struct {
 	stop    context.CancelFunc
 	done    chan struct{}
 	closing atomic.Bool
-	once    sync.Once
+	// fenced is set once another process took over the registration.
+	fenced atomic.Bool
+	once   sync.Once
 
 	// opMu serializes provider operations and guards st and the state below.
 	opMu             sync.Mutex
@@ -103,17 +108,21 @@ type Provider struct {
 	profileRevision  string
 	lastProfile      []byte
 	outcomesReported bool
-	clock            int64
 	lastRecovery     time.Time
-	appliedState     int64
 	endpoints        endpointState
+	// operatorActionAvailable is whether the latest heartbeat reply offered an operator link.
+	operatorActionAvailable bool
+	// operatorAction is the latest operator link, which is only kept in memory.
+	operatorAction *OperatorAction
 
 	mu            sync.Mutex
 	status        *serverStatus
 	events        []event
 	readiness     Readiness
 	registrations map[string]extension
-	dirty         atomic.Bool
+	// dirty requests an early heartbeat within the minimum update interval, and urgent one
+	// that is sent at once.
+	dirty, urgent atomic.Bool
 
 	// published and authority are snapshots used by assisted joins.
 	published atomic.Pointer[[]candidate]
@@ -130,22 +139,25 @@ func New(ctx context.Context, conf Config) (*Provider, error) {
 	if conf.Log == nil {
 		conf.Log = slog.Default()
 	}
-	if conf.Mode == "" {
-		conf.Mode = ModeAutomatic
-	}
 	if conf.Address == "" {
 		conf.Address = ":0"
 	}
 	if conf.AssistedJoins {
 		conf.WebSocket = true
 	}
-	if conf.Placement != nil {
-		if err := conf.Placement.validate(); err != nil {
-			return nil, err
-		}
+	if conf.Software != nil && !conf.Software.valid() {
+		return nil, errors.New("nxs: Software needs a name of 1 to 64 and a version of 1 to 128 characters")
 	}
-	if conf.Mode == ModeAttachInstance && (conf.Token == "" || conf.Placement == nil) {
-		return nil, errors.New("nxs: attach-instance requires Token and Placement")
+	if conf.Location != nil && !conf.Location.valid() {
+		return nil, errors.New("nxs: Location needs a country code or coordinates within range, and a city of at most 120 characters")
+	}
+	if utf8.RuneCountInString(conf.Label) > 128 || strings.ContainsFunc(conf.Label, isControl) {
+		return nil, errors.New("nxs: Label must be at most 128 characters without control characters")
+	}
+	for _, e := range conf.Endpoints {
+		if !e.IsValid() || e.Port() == 0 || e.Addr().IsUnspecified() || e.Addr().IsMulticast() || e.Addr().Zone() != "" {
+			return nil, fmt.Errorf("nxs: endpoint %s cannot be advertised", e)
+		}
 	}
 	s, err := openStore(conf.StateDir)
 	if err != nil {
@@ -190,7 +202,7 @@ func (p *Provider) start(ctx context.Context) error {
 	if p.conf.Token != "" {
 		scheme = schemeBearer
 	}
-	if err := p.disc.validate(p.origin, scheme, p.conf.Mode); err != nil {
+	if err := p.disc.validate(p.origin, scheme); err != nil {
 		return fmt.Errorf("nxs: discovery: %w", err)
 	}
 	if p.conf.WebSocket {
@@ -255,14 +267,18 @@ func (p *Provider) startGeneration() error {
 		p.mu.Unlock()
 	}
 	p.mu.Lock()
-	p.readiness = st.Registration.Readiness
+	p.readiness = Readiness{}
 	p.mu.Unlock()
 	p.profileRevision, p.lastProfile, p.outcomesReported = "", nil, false
 	return p.store.save(st)
 }
 
-// poke requests an early heartbeat.
+// poke requests an early heartbeat for changed status or player counts.
 func (p *Provider) poke() { p.dirty.Store(true) }
+
+// pokeNow requests an immediate heartbeat for a changed host profile or willingness to accept
+// players, which is not held back by the minimum update interval.
+func (p *Provider) pokeNow() { p.urgent.Store(true) }
 
 // Readiness returns the latest readiness observation of the provider.
 func (p *Provider) Readiness() Readiness {
@@ -282,8 +298,8 @@ func (p *Provider) PublicAddress() string {
 	return p.st.Registration.PublicAddress
 }
 
-// Extensions returns the optional provider metadata returned with the registration, such
-// as a link to claim the service. Its keys are reverse-DNS namespaces.
+// Extensions returns the optional provider metadata returned with the registration. Its keys
+// are reverse-DNS namespaces.
 func (p *Provider) Extensions() map[string]json.RawMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -302,10 +318,16 @@ func (p *Provider) GameJoined(conn interface{ RemoteAddr() net.Addr }) {
 }
 
 // GameRejected reports that the game rejected the player of an admitted connection, with
-// a short reason code. It must only be called if Config.GameOutcomes is set.
+// a short lowercase reason code of at most 128 characters, such as "server_full". Any other
+// reason is left out. It must only be called if Config.GameOutcomes is set.
 func (p *Provider) GameRejected(conn interface{ RemoteAddr() net.Addr }, reason string) {
+	if !reasonPattern.MatchString(reason) {
+		reason = ""
+	}
 	p.host.gameOutcome(conn.RemoteAddr(), "ticket.game_rejected", reason)
 }
+
+var reasonPattern = regexp.MustCompile(`^[a-z0-9_.-]{1,128}$`)
 
 // Signal always returns an error, as players are signaled by the provider.
 func (p *Provider) Signal(context.Context, *nethernet.Signal) error {
@@ -319,10 +341,10 @@ func (p *Provider) Notify(n nethernet.Notifier) (stop func()) {
 		return func() {}
 	}
 	p.host.setListener(a)
-	p.poke()
+	p.pokeNow()
 	return sync.OnceFunc(func() {
 		p.host.clearListener(a)
-		p.poke()
+		p.pokeNow()
 	})
 }
 
@@ -336,6 +358,9 @@ func (p *Provider) Credentials(context.Context) (*nethernet.Credentials, error) 
 func (p *Provider) NetworkID() string {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
+	if p.st.Registration == nil {
+		return ""
+	}
 	return p.st.Registration.InstanceID
 }
 
@@ -361,13 +386,13 @@ func (p *Provider) Addr() net.Addr { return p.host.Addr() }
 // Established connections and admissions already in progress are not affected.
 func (p *Provider) Pause() {
 	p.host.pause()
-	p.poke()
+	p.pokeNow()
 }
 
 // Resume admits players again after Pause.
 func (p *Provider) Resume() {
 	p.host.resume()
-	p.poke()
+	p.pokeNow()
 }
 
 // Close stops accepting players, reports this to the provider and closes the gameplay
@@ -380,12 +405,16 @@ func (p *Provider) Close() error {
 		p.host.stop()
 		p.stop()
 		<-p.done
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, _, e := p.heartbeat(ctx); e != nil {
-			p.log.Debug("final heartbeat failed", "error", e)
+		if !p.fenced.Load() {
+			// Until the provider sees acceptingPlayers false, it routes players here for the rest
+			// of the lease, so the final heartbeat gets as long as any other request.
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if _, _, e := p.heartbeat(ctx); e != nil {
+				p.log.Debug("final heartbeat failed", "error", e)
+			}
+			_ = p.flush(ctx)
 		}
-		_ = p.flush(ctx)
 		err = p.shutdown()
 	})
 	return err

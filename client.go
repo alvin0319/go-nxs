@@ -11,6 +11,7 @@ import (
 	"io"
 	mrand "math/rand/v2"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 )
@@ -31,6 +32,8 @@ func (e *Error) Error() string {
 	}
 	return fmt.Sprintf("nxs: provider error %d", e.Status)
 }
+
+var errorCodePattern = regexp.MustCompile(`^[a-z0-9_]{1,80}$`)
 
 func (e *Error) retryable() bool {
 	switch e.Status {
@@ -88,7 +91,7 @@ func (c *client) do(ctx context.Context, req request, v any) error {
 				if perr.RetryAfter > 10*time.Second {
 					return err
 				}
-				delay = perr.RetryAfter
+				delay = max(delay, perr.RetryAfter)
 			}
 			select {
 			case <-ctx.Done():
@@ -154,7 +157,7 @@ func (c *client) response(status int, header http.Header, b []byte, v any) (retr
 		var body struct {
 			Code string `json:"code"`
 		}
-		if json.Unmarshal(b, &body) == nil {
+		if json.Unmarshal(b, &body) == nil && errorCodePattern.MatchString(body.Code) {
 			e.Code = body.Code
 		}
 		if s, err := strconv.Atoi(header.Get("Retry-After")); err == nil && s >= 0 {

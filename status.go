@@ -17,9 +17,9 @@ func parsePong(b []byte) (*serverStatus, bool) {
 		return nil, false
 	}
 	s := &serverStatus{
-		Name:       listingText(fields[1]),
-		Level:      listingText(fields[7]),
-		MaxPlayers: min(max(maxPlayers, 0), 1000000),
+		Name:           listingText(fields[1]),
+		Level:          listingText(fields[7]),
+		MaxPlayerCount: min(max(maxPlayers, 0), 1000000),
 	}
 	switch strings.ToLower(fields[8]) {
 	case "creative", "1":

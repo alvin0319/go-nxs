@@ -7,17 +7,19 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
 // signed performs an operation signed with the machine key. opMu must be held.
 func (p *Provider) signed(ctx context.Context, op string, body, v any, attempts int, timeout time.Duration) error {
-	return p.signedRequest(ctx, http.MethodPost, p.disc.Operations[op], p.ws.carrier(op), body, v, attempts, timeout, randomID())
+	return p.signedRequest(ctx, http.MethodPost, opURL(p.origin, op), p.ws.carrier(op), body, v, attempts, timeout, randomID())
 }
 
 // signedRequest performs a request signed with the machine key. opMu must be held.
 func (p *Provider) signedRequest(ctx context.Context, method, u string, carrier func(context.Context, http.Header, []byte) (int, http.Header, []byte, error), body, v any, attempts int, timeout time.Duration, idempotencyKey string) error {
+	if p.st.Registration == nil {
+		return errUnregistered
+	}
 	var b []byte
 	if body != nil {
 		var err error
@@ -31,7 +33,7 @@ func (p *Provider) signedRequest(ctx context.Context, method, u string, carrier 
 		return err
 	}
 	reg, gen, seq, key := p.st.Registration, p.st.Generation, p.st.Sequence, p.key
-	return p.client.do(ctx, request{
+	err := p.client.do(ctx, request{
 		method:   method,
 		url:      u,
 		body:     b,
@@ -42,6 +44,26 @@ func (p *Provider) signedRequest(ctx context.Context, method, u string, carrier 
 			return signHeaders(h, p.origin, method, path, reg, key, idempotencyKey, gen, seq, b)
 		},
 	}, v)
+	if hasCode(err, codeGenerationFenced) {
+		p.fence()
+	}
+	return err
+}
+
+// ErrReplaced is the cause of the canceled context of a Provider that stopped because another
+// process took over its registration.
+var ErrReplaced = errors.New("nxs: another process took over the registration")
+
+// fence stops a Provider whose registration another process took over, without draining or
+// deregistering the registration, which now belongs to that process. opMu must be held.
+func (p *Provider) fence() {
+	if p.fenced.Swap(true) {
+		return
+	}
+	p.log.Error("another process took over this registration, stopping")
+	p.authority.Store(nil)
+	p.host.stop()
+	p.cancel(ErrReplaced)
 }
 
 // upgradeHeaders returns the signed headers of a WebSocket upgrade. opMu must be held.
@@ -54,7 +76,7 @@ func (p *Provider) upgradeHeaders(rawURL string) (http.Header, error) {
 	if err := signHeaders(h, p.origin, http.MethodGet, u.EscapedPath(), p.st.Registration, p.key, randomID(), p.st.Generation, p.st.Sequence, nil); err != nil {
 		return nil, err
 	}
-	if p.conf.AssistedJoins {
+	if p.assisting() {
 		h.Set("nxs-assisted", "1")
 	}
 	return h, nil
@@ -86,13 +108,32 @@ func signHeaders(h http.Header, origin, method, path string, reg *registration, 
 	return nil
 }
 
-// recoverable reports whether err suggests the registration generation was fenced.
-func recoverable(err error) bool {
+const (
+	codeRecoveryRequired    = "recovery_required"
+	codeRecoveryUnavailable = "recovery_unavailable"
+	codeGenerationFenced    = "generation_fenced"
+)
+
+// hasCode reports whether err is a provider error with the code.
+func hasCode(err error, code string) bool {
 	var e *Error
-	if !errors.As(err, &e) {
+	return errors.As(err, &e) && e.Code == code
+}
+
+// errUnregistered is returned for operations while the instance has no registration.
+var errUnregistered = errors.New("nxs: not registered with the provider")
+
+// recoverable reports whether err suggests the registration must be resumed in a new
+// generation, or registered again. A generation fenced by another process is never recovered.
+func recoverable(err error) bool {
+	if errors.Is(err, errUnregistered) {
+		return true
+	}
+	var e *Error
+	if !errors.As(err, &e) || e.Code == codeGenerationFenced {
 		return false
 	}
-	return e.Status == http.StatusUnauthorized || strings.Contains(e.Code, "recovery") || strings.Contains(e.Code, "generation")
+	return e.Status == http.StatusUnauthorized || e.Code == codeRecoveryRequired
 }
 
 // recoverSession resumes the registration in a new generation after it was fenced. opMu
@@ -102,7 +143,25 @@ func (p *Provider) recoverSession(ctx context.Context) error {
 		return errors.New("nxs: recovery attempted recently")
 	}
 	p.lastRecovery = time.Now()
-	if err := p.recover(ctx, p.st.Registration.RegistrationID, publicJWK(&p.key.PublicKey).thumbprint()); err != nil {
+	err := errNothingToRecover
+	if p.st.Registration != nil {
+		err = p.recover(ctx, p.st.Registration.RegistrationID, p.thumbprint(), false)
+	}
+	if errors.Is(err, errNothingToRecover) {
+		err = nil
+		if p.st.Registration != nil {
+			p.log.Warn("provider no longer holds this registration, registering as a new instance")
+			err = p.resetState()
+		}
+		if err == nil {
+			err = p.register(ctx)
+		}
+		p.host.setKeys(p.st.keys())
+		if err == nil {
+			p.log.Info("registered with provider", "instance", p.st.Registration.InstanceID, "publicAddress", p.st.Registration.PublicAddress)
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("nxs: recover registration: %w", err)
 	}
 	if err := p.startGeneration(); err != nil {

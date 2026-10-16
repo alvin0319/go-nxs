@@ -28,7 +28,7 @@ func (p *Provider) RotateMachineKey(ctx context.Context) error {
 	}
 	pub := publicJWK(&next.PublicKey)
 	oldKeyID, idempotencyKey := p.st.Registration.KeyID, randomID()
-	proof, err := canon.Array(Protocol, "rotate", p.origin, p.st.Registration.InstanceID, oldKeyID, pub.thumbprint(), p.st.Generation, idempotencyKey)
+	proof, err := rotationProof(p.origin, p.st.Registration.InstanceID, oldKeyID, pub.thumbprint(), p.st.Generation, idempotencyKey)
 	if err != nil {
 		return err
 	}
@@ -40,7 +40,7 @@ func (p *Provider) RotateMachineKey(ctx context.Context) error {
 		KeyID string `json:"keyId"`
 	}
 	body := map[string]any{"publicKeyJwk": pub, "proof": sig}
-	if err := p.signedRequest(ctx, http.MethodPost, p.disc.Operations["rotate"], p.ws.carrier("rotate"), body, &resp, 3, 15*time.Second, idempotencyKey); err != nil {
+	if err := p.signedRequest(ctx, http.MethodPost, opURL(p.origin, "rotate"), p.ws.carrier("rotate"), body, &resp, 3, 15*time.Second, idempotencyKey); err != nil {
 		return fmt.Errorf("nxs: rotate machine key: %w", err)
 	}
 	if resp.KeyID == "" {
@@ -57,6 +57,11 @@ func (p *Provider) RotateMachineKey(ctx context.Context) error {
 	}
 	p.log.Info("rotated machine key", "keyID", resp.KeyID)
 	return nil
+}
+
+// rotationProof returns the bytes the replacement machine key signs to prove its possession.
+func rotationProof(audience, instanceID, oldKeyID, newThumbprint string, generation int64, idempotencyKey string) ([]byte, error) {
+	return canon.Array(Protocol, "rotate", audience, instanceID, oldKeyID, newThumbprint, generation, idempotencyKey)
 }
 
 // ExtensionRequest performs an operation advertised by a provider extension in discovery,

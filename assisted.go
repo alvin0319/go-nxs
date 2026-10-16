@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/df-mc/go-nethernet"
 	"github.com/df-mc/go-nxs/admission"
@@ -75,10 +77,8 @@ func decodeAssistedJoin(b []byte) (*assistedJoin, error) {
 	if len(b) > maxAssistedBytes {
 		return nil, errors.New("assisted join too large")
 	}
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
 	j := &assistedJoin{}
-	if err := dec.Decode(j); err != nil {
+	if err := json.Unmarshal(b, j); err != nil {
 		return nil, fmt.Errorf("decode assisted join: %w", err)
 	}
 	if j.Kind != "assisted-join" || j.Version != 1 || !joinIDPattern.MatchString(j.ID) || !instanceIDPattern.MatchString(j.InstanceID) ||
@@ -201,11 +201,8 @@ func parseCPK(cpk string) (*ecdsa.PublicKey, error) {
 }
 
 // assist admits an assisted join and returns the SDP answer and the deadline for sending it.
-func (p *Provider) assist(b []byte) (string, time.Time, error) {
-	j, err := decodeAssistedJoin(b)
-	if err != nil {
-		return "", time.Time{}, err
-	}
+// Once ctx is canceled, a peer that has not connected yet is stopped.
+func (p *Provider) assist(ctx context.Context, j *assistedJoin) (string, time.Time, error) {
 	deadline := time.UnixMilli(j.ExpiresAt)
 	remaining, limit := time.Until(deadline), maxAssistedLifetime
 	if j.NetworkID == "0" {
@@ -227,13 +224,18 @@ func (p *Provider) assist(b []byte) (string, time.Time, error) {
 	if err != nil {
 		return "", deadline, err
 	}
-	family := 4
-	if ip, _ := netip.ParseAddr(o.candidates[0].Address); ip.Is6() {
-		family = 6
+	var (
+		family int
+		cands  []candidate
+	)
+	for _, f := range o.families() {
+		if cands = p.answerCandidates(f); len(cands) > 0 {
+			family = f
+			break
+		}
 	}
-	cands := p.answerCandidates(family)
 	if len(cands) == 0 {
-		return "", deadline, errors.New("no public candidate for the address family of the player")
+		return "", deadline, errors.New("no public candidate for the address families of the player")
 	}
 	adm := nethernet.Admission{
 		ICE:        webrtc.ICEParameters{UsernameFragment: o.ufrag, Password: o.password},
@@ -243,7 +245,7 @@ func (p *Provider) assist(b []byte) (string, time.Time, error) {
 	}
 
 	if j.NetworkID == "0" {
-		if err := p.assistDiagnostic(j, o, adm, family); err != nil {
+		if err := p.assistDiagnostic(ctx, j, o, adm, family); err != nil {
 			return "", deadline, err
 		}
 		cands = cands[:1]
@@ -252,31 +254,62 @@ func (p *Provider) assist(b []byte) (string, time.Time, error) {
 		if err != nil {
 			return "", deadline, fmt.Errorf("parse identity key: %w", err)
 		}
-		a, ok := h.reserve(j.LocalUfrag, netip.AddrPort{}, deadline, nil)
-		if !ok {
-			return "", deadline, errors.New("no capacity for assisted join")
+		a, reason := h.reserve(j.LocalUfrag, netip.AddrPort{}, deadline, nil)
+		if a == nil {
+			return "", deadline, fmt.Errorf("assisted join rejected: %s", reason)
 		}
+		a.ctx = ctx
 		adm.NetworkID, adm.PublicKey = j.NetworkID, pub
+		adm.VerifyPublicKey = h.verifier(a, deadline, func(got *ecdsa.PublicKey) bool { return pub.Equal(got) })
 		go h.establish(a, adm, j.LocalPassword)
 	}
 	return answer(j.LocalUfrag, j.LocalPassword, h.fingerprint, cands), deadline, nil
 }
 
+// families returns the address families of the candidates of o, in their order.
+func (o *offer) families() []int {
+	var families []int
+	for _, c := range o.candidates {
+		f := 4
+		if ip, _ := netip.ParseAddr(c.Address); ip.Is6() {
+			f = 6
+		}
+		if !slices.Contains(families, f) {
+			families = append(families, f)
+		}
+	}
+	return families
+}
+
 // assistDiagnostic admits an assisted diagnostic.
-func (p *Provider) assistDiagnostic(j *assistedJoin, o *offer, adm nethernet.Admission, family int) error {
+func (p *Provider) assistDiagnostic(ctx context.Context, j *assistedJoin, o *offer, adm nethernet.Admission, family int) error {
 	h := p.host
 	key, ok := (*h.keys.Load())[j.KeyID]
-	if !ok {
+	if !ok || !key.Usable(time.Now()) {
 		return errors.New("unknown admission key")
 	}
 	claims, err := key.Open(h.audience, j.LocalUfrag, o.ufrag)
 	if err != nil || claims.NetworkID != 0 || claims.Diagnostic.Profile != admission.ProfileAssisted ||
-		claims.ExpiresAt.UnixMilli() != j.ExpiresAt || key.ICEPassword(h.audience, j.LocalUfrag) != j.LocalPassword ||
-		claims.Password != o.password || !bytes.Equal(claims.Fingerprint[:], o.fingerprint) {
+		hex.EncodeToString(claims.IdentityBinding[:]) != j.ID || claims.ExpiresAt.UnixMilli() != j.ExpiresAt ||
+		key.ICEPassword(h.audience, j.LocalUfrag) != j.LocalPassword || claims.Password != o.password ||
+		!bytes.Equal(claims.Fingerprint[:], o.fingerprint) {
 		return errors.New("assisted diagnostic does not match its permit")
 	}
 	if sha256.Sum256([]byte(j.Offer)) != claims.Diagnostic.OfferDigest {
 		return errors.New("assisted diagnostic offer does not match its permit")
+	}
+	if err := checkDiagnosticOffer(j.Offer, o.ufrag, family); err != nil {
+		return err
+	}
+	remote, _ := netip.ParseAddr(o.candidates[0].Address)
+	switch {
+	case h.reachable(remote):
+	case family == 4 && scopeOf(remote) == scopePrivate && o.candidates[0].Typ == webrtc.ICECandidateTypeHost:
+		// A private address is not a diagnostic destination, so the public address of the
+		// prober is learned from its authenticated checks instead.
+		adm.Candidates = nil
+	default:
+		return errors.New("assisted diagnostic offers no public candidate")
 	}
 	if err := h.authorizeDiagnostic(key, claims, family); err != nil {
 		return err
@@ -285,8 +318,113 @@ func (p *Provider) assistDiagnostic(j *assistedJoin, o *offer, adm nethernet.Adm
 	if !ok {
 		return errors.New("no capacity for assisted diagnostic")
 	}
+	a.ctx = ctx
 	adm.NetworkID = "0"
-	go h.echo(a, adm, j.LocalPassword, claims)
+	go h.echo(a, adm, j.LocalPassword, key, claims, family)
+	return nil
+}
+
+var (
+	diagnosticMediaPattern      = regexp.MustCompile(`^application [0-9]{1,5} UDP/DTLS/SCTP webrtc-datachannel$`)
+	diagnosticFoundationPattern = regexp.MustCompile(`^[A-Za-z0-9+/]{1,32}$`)
+	diagnosticNumberPattern     = regexp.MustCompile(`^[0-9]{1,10}$`)
+)
+
+// checkDiagnosticOffer checks an assisted diagnostic offer against the closed SDP profile of
+// diagnostics, which allows a single host or server-reflexive candidate of the family.
+func checkDiagnosticOffer(sdp, ufrag string, family int) error {
+	invalid := errors.New("assisted diagnostic offer is outside the diagnostic SDP profile")
+	if sdp == "" || len(sdp) > 16384 || !utf8.ValidString(sdp) || strings.ContainsRune(sdp, 0) ||
+		strings.ContainsRune(strings.ReplaceAll(sdp, "\r\n", ""), '\r') {
+		return invalid
+	}
+	var lines []string
+	for _, l := range strings.Split(sdp, "\n") {
+		if l = strings.TrimSuffix(l, "\r"); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	one := func(prefix string) (string, bool) {
+		var found []string
+		for _, l := range lines {
+			if v, ok := strings.CutPrefix(l, prefix); ok {
+				found = append(found, v)
+			}
+		}
+		return strings.Join(found, "\n"), len(found) == 1
+	}
+	for prefix, want := range map[string]string{"a=group:": "BUNDLE 0", "a=mid:": "0"} {
+		if v, ok := one(prefix); !ok || v != want {
+			return invalid
+		}
+	}
+	media, ok := one("m=")
+	if !ok || !diagnosticMediaPattern.MatchString(media) {
+		return invalid
+	}
+	if port, _ := strconv.Atoi(strings.Fields(media)[1]); port < 1 || port > 65535 {
+		return invalid
+	}
+	ends := 0
+	for _, l := range lines {
+		if strings.HasPrefix(l, "a=ice-lite") || strings.HasPrefix(l, "a=identity:") {
+			return invalid
+		}
+		if l == "a=end-of-candidates" {
+			ends++
+		}
+	}
+	line, ok := one("a=candidate:")
+	if !ok || ends != 1 {
+		return invalid
+	}
+	f := strings.Split(line, " ")
+	if len(f) < 8 || len(f) > 20 || len(f)%2 != 0 || !diagnosticFoundationPattern.MatchString(f[0]) || f[1] != "1" ||
+		!strings.EqualFold(f[2], "udp") || !diagnosticNumberPattern.MatchString(f[3]) || f[6] != "typ" {
+		return invalid
+	}
+	if _, err := strconv.ParseUint(f[3], 10, 32); err != nil {
+		return invalid
+	}
+	if port, err := strconv.ParseUint(f[5], 10, 16); err != nil || port == 0 || len(f[5]) > 5 {
+		return invalid
+	}
+	reflexive := f[7] == "srflx"
+	if f[7] != "host" && !reflexive {
+		return invalid
+	}
+	seen := map[string]bool{}
+	for i := 8; i < len(f); i += 2 {
+		name, value := f[i], f[i+1]
+		if seen[name] {
+			return invalid
+		}
+		seen[name] = true
+		switch name {
+		case "raddr":
+			addr, err := netip.ParseAddr(value)
+			if !reflexive || err != nil || addr.Zone() != "" || (family == 6) != (addr.Is6() && !addr.Is4In6()) {
+				return invalid
+			}
+		case "rport":
+			if port, err := strconv.ParseUint(value, 10, 16); !reflexive || err != nil || port == 0 || len(value) > 5 {
+				return invalid
+			}
+		case "ufrag":
+			if value != ufrag {
+				return invalid
+			}
+		case "generation", "network-id", "network-cost":
+			if _, err := strconv.ParseUint(value, 10, 32); err != nil || !diagnosticNumberPattern.MatchString(value) {
+				return invalid
+			}
+		default:
+			return invalid
+		}
+	}
+	if seen["raddr"] != seen["rport"] {
+		return invalid
+	}
 	return nil
 }
 
@@ -306,7 +444,7 @@ func (p *Provider) answerCandidates(family int) []candidate {
 	if published := p.published.Load(); published != nil {
 		for _, c := range *published {
 			addr, err := netip.ParseAddr(c.Address)
-			if err != nil || addr.IsPrivate() || (family == 6) != addr.Is6() {
+			if err != nil || !p.host.reachable(addr) || (family == 6) != addr.Is6() {
 				continue
 			}
 			if !containsEndpoint(out, c) {
